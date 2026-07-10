@@ -30,16 +30,42 @@ func NewV4Extractor() *V4Extractor {
 	return &V4Extractor{}
 }
 
+// Extract obtains the database key via Frida (CCKeyDerivationPBKDF) only.
+// Memory scanning for data keys has been removed (broken on WeChat 4.1.8+).
+//
+// Context keys:
+//   - status_callback: func(string)
+//   - force_rescan_memory / force_key_refresh: skip all_keys.json cache and re-run Frida
+//   - image_key_only: only image key path (skips data-key Frida when cache has data key)
 func (e *V4Extractor) Extract(ctx context.Context, proc *model.Process) (string, string, error) {
 	statusCB, _ := ctx.Value("status_callback").(func(string))
 	imageOnly, _ := ctx.Value("image_key_only").(bool)
 	forceRescan, _ := ctx.Value("force_rescan_memory").(bool)
-	if proc == nil || proc.DataDir == "" {
-		return "", "", fmt.Errorf("macOS 数据目录未就绪，请确保微信已登录")
+	forceRefresh, _ := ctx.Value("force_key_refresh").(bool)
+	forceRescan = forceRescan || forceRefresh
+
+	if proc == nil {
+		return "", "", fmt.Errorf("进程信息为空")
 	}
 
-	// 1) 非强制模式：优先使用已有 all_keys.json（wx-cli 模式）。
-	if !forceRescan {
+	// Image-only: do not re-extract data key via Frida unless missing from cache.
+	if imageOnly {
+		if proc.DataDir == "" {
+			return "", "", fmt.Errorf("macOS 数据目录未就绪，请确保微信已登录")
+		}
+		dataKey := ""
+		if key, err := loadAndValidateMessageKey(proc.DataDir, statusCB); err == nil {
+			dataKey = key
+		}
+		imgKey, err := e.pickImageKeyWithTiming(ctx, proc, statusCB, true)
+		if err != nil {
+			return dataKey, "", err
+		}
+		return strings.ToLower(dataKey), imgKey, nil
+	}
+
+	// 1) Cache: all_keys.json (already extracted earlier)
+	if !forceRescan && proc.DataDir != "" {
 		if statusCB != nil {
 			statusCB("检查 all_keys.json...")
 		}
@@ -47,35 +73,54 @@ func (e *V4Extractor) Extract(ctx context.Context, proc *model.Process) (string,
 			if statusCB != nil {
 				statusCB("已从 all_keys.json 获取密钥")
 			}
-			imgKey, err := e.pickImageKeyWithTiming(ctx, proc, statusCB, imageOnly)
+			imgKey, err := e.pickImageKeyWithTiming(ctx, proc, statusCB, false)
 			if err != nil {
-				return "", "", err
+				return strings.ToLower(key), "", nil
 			}
 			return strings.ToLower(key), imgKey, nil
 		}
-	} else {
+	} else if forceRescan && proc.DataDir != "" {
 		if statusCB != nil {
-			statusCB("已启用强制重扫：跳过旧 all_keys.json，重新扫描进程内存...")
+			statusCB("强制刷新：将通过 Frida 重新提取数据库密钥...")
 		}
 		_ = removeAllKeysFile(proc.DataDir)
 	}
 
-	// 2) 不存在/无效时，执行一次 init 风格全库扫描并落盘 all_keys.json。
+	// 2) Only extraction backend: Frida Hook CCKeyDerivationPBKDF
+	if !FridaAvailable() {
+		return "", "", fmt.Errorf(
+			"提取数据库密钥需要 Frida：请先执行 pip3 install frida-tools\n" +
+				"然后运行: chatlog key --frida\n" +
+				"或在 TUI 选择「重启并获取密钥」",
+		)
+	}
 	if statusCB != nil {
-		statusCB("开始 init 风格扫描：收集 DB salt -> 内存扫描 -> 写入 all_keys.json")
+		statusCB("使用 Frida Hook CCKeyDerivationPBKDF 提取数据库密钥（将重启微信，请登录）...")
 	}
-	key, _, err := InitAllKeysByPID(proc.PID, proc.DataDir, statusCB)
+	dataDir := ""
+	if proc != nil {
+		dataDir = proc.DataDir
+	}
+	key, err := ExtractKeyViaFrida(ctx, dataDir, statusCB)
 	if err != nil {
-		return "", "", err
+		return "", "", fmt.Errorf("Frida 提取密钥失败: %w", err)
 	}
-	if forceRescan && statusCB != nil {
-		statusCB("本轮已完成内存重扫，all_keys.json 已更新，正在选取可用密钥...")
+	key = strings.ToLower(key)
+
+	// If dataDir became available later, Apply is already attempted inside ExtractKeyViaFrida.
+	// Re-apply when we now know dataDir.
+	if dataDir != "" {
+		if _, _, applyErr := ApplyCapturedKeyToDataDir(dataDir, key, statusCB); applyErr != nil {
+			log.Debug().Err(applyErr).Msg("apply frida key after extract")
+		}
 	}
-	imgKey, err := e.pickImageKeyWithTiming(ctx, proc, statusCB, imageOnly)
-	if err != nil {
-		return "", "", err
+
+	imgKey, imgErr := e.pickImageKeyWithTiming(ctx, proc, statusCB, false)
+	if imgErr != nil {
+		log.Debug().Err(imgErr).Msg("image key optional after frida data key")
+		return key, "", nil
 	}
-	return strings.ToLower(key), imgKey, nil
+	return key, imgKey, nil
 }
 
 func removeAllKeysFile(dataDir string) error {
@@ -96,6 +141,7 @@ func removeAllKeysFile(dataDir string) error {
 func (e *V4Extractor) SearchKey(ctx context.Context, memory []byte) (string, bool) {
 	_ = ctx
 	_ = memory
+	// Data-key memory patterns removed (WeChat 4.1.8+).
 	return "", false
 }
 
@@ -538,7 +584,6 @@ func loadAllKeys(dataDir string) (map[string]string, error) {
 		}
 	}
 	if used == "" && permErrPath != "" {
-		// 兼容历史 root:600 场景：尝试自动提权修复权限后再读一次。
 		if fixErr := repairAllKeysPermission(permErrPath); fixErr == nil {
 			content, err = os.ReadFile(permErrPath)
 			if err == nil {
@@ -547,7 +592,7 @@ func loadAllKeys(dataDir string) (map[string]string, error) {
 		}
 	}
 	if used == "" {
-		return nil, fmt.Errorf("未找到 all_keys.json（请先用 mac 提 key 工具生成）")
+		return nil, fmt.Errorf("未找到 all_keys.json（请先用 chatlog key --frida 提取）")
 	}
 
 	raw := map[string]keyFileEntry{}
@@ -577,7 +622,6 @@ func repairAllKeysPermission(path string) error {
 		return fmt.Errorf("empty all_keys path")
 	}
 	if os.Geteuid() == 0 {
-		// root 进程直接修复为当前用户（若存在 SUDO_UID/SUDO_GID 则转回调用用户）
 		_ = normalizeAllKeysOwnership(path)
 		return nil
 	}
@@ -596,11 +640,6 @@ func escapeAppleScriptForOSA(s string) string {
 	s = strings.ReplaceAll(s, "\\", "\\\\")
 	s = strings.ReplaceAll(s, "\"", "\\\"")
 	return s
-}
-
-func isMessageDB(p string) bool {
-	p = normalizePath(p)
-	return strings.HasSuffix(p, "/message/message_0.db") || p == "message/message_0.db"
 }
 
 func normalizePath(p string) string {
@@ -852,7 +891,6 @@ func deriveImageKeyByCodeAndWxid(dataDir string, status func(string)) (string, b
 		return "", false
 	}
 
-	// WeFlow 对齐：优先在可用账号目录中拿模板密文做验真。
 	for _, accountPath := range accountPaths {
 		tpl, ok := findTemplateData(accountPath, 32)
 		if !ok || len(tpl.Ciphertext) != 16 {
@@ -872,7 +910,6 @@ func deriveImageKeyByCodeAndWxid(dataDir string, status func(string)) (string, b
 				if !verifyImageAesKeyWeFlow(keyBytes, tpl.Ciphertext) {
 					continue
 				}
-				// 强验真：要求完整模板 dat 可解，避免误命中。
 				oldXor := dat2img.V4XorKey
 				dat2img.V4XorKey = xorKey
 				okStrong := verifyImageAesKeyStrong(keyBytes, tpl.TemplateData)
@@ -888,8 +925,6 @@ func deriveImageKeyByCodeAndWxid(dataDir string, status func(string)) (string, b
 		}
 	}
 
-	// WeFlow 对齐：拿不到模板时，回退到“首个 code + 首个 wxid”未验真结果。
-	// 这样行为与 WeFlow 一致，但可靠性低于模板验真路径。
 	if len(accountPaths) == 0 {
 		xorKey, aesKey := deriveImageKeyFromCodeWxid(codes[0], wxids[0])
 		dat2img.V4XorKey = xorKey
@@ -898,7 +933,6 @@ func deriveImageKeyByCodeAndWxid(dataDir string, status func(string)) (string, b
 		}
 		return aesKey, true
 	}
-	// 如果有账号目录但都无法形成模板验真，也和 WeFlow一致走回退。
 	xorKey, aesKey := deriveImageKeyFromCodeWxid(codes[0], wxids[0])
 	dat2img.V4XorKey = xorKey
 	if status != nil {

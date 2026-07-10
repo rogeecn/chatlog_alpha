@@ -306,7 +306,7 @@ func (a *App) initMenu() {
 	restartAndGetDataKey := &menu.Item{
 		Index:       3,
 		Name:        "重启并获取密钥",
-		Description: "结束当前微信进程，重启后获取密钥",
+		Description: "Frida Hook 提取数据库密钥（需 pip3 install frida-tools）",
 		Selected: func(i *menu.Item) {
 			modal := tview.NewModal().SetText("正在准备重启微信...")
 			a.mainPages.AddPage("modal", modal, true, true)

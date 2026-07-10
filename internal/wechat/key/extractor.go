@@ -22,7 +22,8 @@ type Extractor interface {
 	SetValidate(validator *decrypt.Validator)
 }
 
-// NewExtractor 创建适合当前平台的密钥提取器（内置实现，不依赖外部 DLL）。
+// NewExtractor 创建适合当前平台的密钥提取器。
+// macOS V4：data key 仅通过 Frida Hook CCKeyDerivationPBKDF；图片 key 仍可内存扫描。
 func NewExtractor(platform string, version int) (Extractor, error) {
 	switch {
 	case platform == "darwin" && version == 4:

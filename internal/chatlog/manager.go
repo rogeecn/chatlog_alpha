@@ -2,11 +2,9 @@ package chatlog
 
 import (
 	"context"
-	"encoding/hex"
 	"fmt"
 	"os"
 	"os/exec"
-	"strconv"
 	"strings"
 	"time"
 
@@ -18,6 +16,7 @@ import (
 	"github.com/sjzar/chatlog/internal/chatlog/wechat"
 	"github.com/sjzar/chatlog/internal/model"
 	iwechat "github.com/sjzar/chatlog/internal/wechat"
+	keydarwin "github.com/sjzar/chatlog/internal/wechat/key/darwin"
 	"github.com/sjzar/chatlog/pkg/config"
 	"github.com/sjzar/chatlog/pkg/util"
 	"github.com/sjzar/chatlog/pkg/util/dat2img"
@@ -209,8 +208,81 @@ func (m *Manager) RestartAndGetDataKey(onStatus func(string)) error {
 	pid := m.ctx.Current.PID
 	exePath := m.ctx.Current.ExePath
 	platform := m.ctx.Current.Platform
+	dataDir := m.ctx.Current.DataDir
+	if dataDir == "" {
+		dataDir = m.ctx.DataDir
+	}
 
-	// 1. Terminate the process
+	// macOS：数据库密钥仅通过 Frida Hook CCKeyDerivationPBKDF 提取（已移除内存扫描）。
+	if platform == "darwin" {
+		if !keydarwin.FridaAvailable() {
+			return fmt.Errorf("提取数据库密钥需要 Frida：请先执行 pip3 install frida-tools")
+		}
+		if onStatus != nil {
+			onStatus("通过 Frida Hook CCKeyDerivationPBKDF 提取密钥（请在弹出的微信中登录）...")
+		}
+		log.Info().Msg("RestartAndGetDataKey: Frida-only data key path")
+
+		ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+		defer cancel()
+
+		key, err := keydarwin.ExtractKeyViaFrida(ctx, dataDir, onStatus)
+		if err != nil {
+			return fmt.Errorf("Frida 提取密钥失败: %w", err)
+		}
+
+		var newInstance *iwechat.Account
+		deadline := time.Now().Add(120 * time.Second)
+		for time.Now().Before(deadline) {
+			if best := pickBestWeChatInstance(m.wechat.GetWeChatInstances(), exePath, platform); best != nil {
+				newInstance = best
+				if best.DataDir != "" {
+					dataDir = best.DataDir
+					break
+				}
+			}
+			if onStatus != nil {
+				onStatus("密钥已捕获，等待微信登录并就绪数据目录...")
+			}
+			time.Sleep(1 * time.Second)
+		}
+		if newInstance != nil {
+			m.ctx.SwitchCurrent(newInstance)
+		}
+		if dataDir != "" {
+			if _, _, applyErr := keydarwin.ApplyCapturedKeyToDataDir(dataDir, key, onStatus); applyErr != nil {
+				log.Warn().Err(applyErr).Msg("apply frida key to all_keys.json failed")
+			}
+		}
+
+		m.ctx.DataKey = key
+		if m.ctx.Current != nil {
+			m.ctx.Current.Key = key
+			m.ctx.Current.DataDir = dataDir
+		}
+		if m.ctx.DataDir == "" && dataDir != "" {
+			m.ctx.DataDir = dataDir
+		}
+
+		if m.ctx.Current != nil {
+			if imgKey, imgErr := m.ctx.Current.GetImageKey(context.Background()); imgErr == nil && imgKey != "" {
+				m.ctx.ImgKey = imgKey
+				dat2img.SetAesKey(imgKey)
+			}
+		}
+		if m.ctx.DataDir != "" {
+			go dat2img.ScanAndSetXorKey(m.ctx.DataDir)
+		}
+		m.ctx.Refresh()
+		m.ctx.UpdateConfig()
+		if onStatus != nil {
+			onStatus("Frida 提取密钥成功")
+		}
+		log.Info().Msg("Successfully got data key via Frida")
+		return nil
+	}
+
+	// Windows / 其他平台：重启进程后走平台 Extractor。
 	if onStatus != nil {
 		onStatus("正在结束微信进程...")
 	}
@@ -223,9 +295,8 @@ func (m *Manager) RestartAndGetDataKey(onStatus func(string)) error {
 		return fmt.Errorf("failed to kill process with PID %d: %w", pid, err)
 	}
 
-	// 2. Wait for the process to disappear
 	log.Info().Msg("Waiting for WeChat process to terminate...")
-	for i := 0; i < 10; i++ { // Wait for max 10 seconds
+	for i := 0; i < 10; i++ {
 		instances := m.wechat.GetWeChatInstances()
 		found := false
 		for _, inst := range instances {
@@ -240,7 +311,6 @@ func (m *Manager) RestartAndGetDataKey(onStatus func(string)) error {
 		time.Sleep(1 * time.Second)
 	}
 
-	// 3. Restart WeChat
 	if onStatus != nil {
 		onStatus("正在重启微信...")
 	}
@@ -249,15 +319,12 @@ func (m *Manager) RestartAndGetDataKey(onStatus func(string)) error {
 		return fmt.Errorf("failed to restart WeChat: %w", err)
 	}
 
-	// 4. Wait for the new process to appear.
 	if onStatus != nil {
 		onStatus("正在等待新进程启动...")
 	}
-	log.Info().Msg("Waiting for new WeChat process to start...")
 	var newInstance *iwechat.Account
-	for i := 0; i < 30; i++ { // Wait for max 30 seconds
+	for i := 0; i < 30; i++ {
 		instances := m.wechat.GetWeChatInstances()
-		// Try to find a new instance. A new instance is one with a different PID.
 		for _, inst := range instances {
 			if inst.PID != pid && inst.ExePath == exePath {
 				newInstance = inst
@@ -269,127 +336,37 @@ func (m *Manager) RestartAndGetDataKey(onStatus func(string)) error {
 		}
 		time.Sleep(1 * time.Second)
 	}
-
 	if newInstance == nil {
 		return fmt.Errorf("failed to find new WeChat process after restart")
 	}
 	log.Info().Msgf("Found new WeChat process with PID %d", newInstance.PID)
-
-	// 5. Switch to the new instance
 	m.ctx.SwitchCurrent(newInstance)
-	restartedAt := time.Now()
 
-	// 6. Get the key
-	// 增加重试逻辑：微信刚启动后模块/数据目录可能未就绪，需要等待。
-	log.Info().Msg("Getting key from new WeChat process...")
-
-	// 使用携带回调的 context。
-	// 重启并获取密钥必须强制重扫，避免命中历史 DataKey/all_keys.json 导致“未真正重扫内存”。
 	ctx := context.WithValue(context.Background(), "status_callback", onStatus)
 	ctx = context.WithValue(ctx, "force_key_refresh", true)
 	ctx = context.WithValue(ctx, "force_rescan_memory", true)
 
 	var key, imgKey string
-	helperTried := false
-
-	// 初始化截止时间：
-	// - macOS: 用户需要完成登录，给更长窗口
-	// - 其他平台: 保持较短等待
 	waitWindow := 30 * time.Second
-	if platform == "darwin" {
-		waitWindow = 180 * time.Second
-	}
 	deadline := time.Now().Add(waitWindow)
 	started := time.Now()
 	attempt := 0
-	readyForScan := false
-
 	for {
 		attempt++
-		elapsed := int(time.Since(started).Seconds())
-		total := int(waitWindow.Seconds())
-
-		// macOS: 每轮重试前重新绑定当前可用微信实例，避免重启后 PID/账户漂移导致持续扫描错误进程。
-		if platform == "darwin" {
-			if best := pickBestWeChatInstance(m.wechat.GetWeChatInstances(), exePath, platform); best != nil {
-				if m.ctx.Current == nil || m.ctx.Current.PID != best.PID {
-					m.ctx.SwitchCurrent(best)
-					if onStatus != nil {
-						onStatus(fmt.Sprintf("已切换到最新微信进程 PID=%d，继续扫描...", best.PID))
-					}
-				}
-			}
-		}
-
 		if onStatus != nil {
-			if platform == "darwin" {
-				if readyForScan {
-					onStatus(fmt.Sprintf("微信已启动，正在扫描并验证密钥...（重试 %d 次，已等待 %ds/%ds）", attempt, elapsed, total))
-				} else {
-					onStatus(fmt.Sprintf("正在等待微信初始化并登录...（重试 %d 次，已等待 %ds/%ds）", attempt, elapsed, total))
-				}
-			} else {
-				onStatus("正在等待微信初始化...")
-			}
+			elapsed := int(time.Since(started).Seconds())
+			onStatus(fmt.Sprintf("正在获取密钥...（重试 %d 次，已等待 %ds/%ds）", attempt, elapsed, int(waitWindow.Seconds())))
 		}
-
-		// macOS: 登录就绪前不触发扫描，避免“未登录就开始扫 key”导致的噪声重试。
-		if platform == "darwin" && !isDarwinLoginReady(m.ctx.Current, restartedAt) {
-			if onStatus != nil {
-				onStatus(fmt.Sprintf("等待微信登录完成后再启动密钥扫描...（重试 %d 次，已等待 %ds/%ds）", attempt, elapsed, total))
-			}
-			if time.Now().After(deadline) {
-				return fmt.Errorf("获取密钥超时: 微信登录未就绪")
-			}
-			time.Sleep(1 * time.Second)
-			continue
-		}
-		if platform == "darwin" {
-			readyForScan = true
-		}
-
-		// 尝试获取密钥
 		key, imgKey, err = m.ctx.Current.GetKey(ctx)
-
 		if err == nil {
 			break
 		}
-		if platform == "darwin" && isDarwinScanStageErr(err) {
-			readyForScan = true
-		}
-
-		// macOS 权限不足时，尝试一次提权 helper。
-		if platform == "darwin" && !helperTried && isDarwinPermissionErr(err) {
-			helperTried = true
-			if onStatus != nil {
-				onStatus("正在请求管理员权限以读取微信进程内存...")
-			}
-			if hk, helperErr := tryDarwinPrivilegedKeyHelper(m.ctx.Current); helperErr == nil && hk != "" {
-				key = hk
-				imgKey = m.ctx.Current.ImgKey
-				err = nil
-				break
-			}
-		}
-
-		err = normalizeKeyAcquireError(err)
 		if !isRetryableKeyErr(err) {
 			return err
 		}
-		if platform == "darwin" && onStatus != nil {
-			if readyForScan {
-				onStatus(fmt.Sprintf("微信已启动，等待聊天窗口触发数据库读取，程序正在自动重试...（重试 %d 次，已等待 %ds/%ds）", attempt, elapsed, total))
-			} else {
-				onStatus(fmt.Sprintf("等待微信登录并打开聊天窗口触发数据库读取，程序正在自动重试...（重试 %d 次，已等待 %ds/%ds）", attempt, elapsed, total))
-			}
-		}
-
 		if time.Now().After(deadline) {
 			return fmt.Errorf("获取密钥超时: %v", err)
 		}
-
-		log.Debug().Err(err).Msg("获取密钥尝试失败，准备重试")
-
 		time.Sleep(1 * time.Second)
 	}
 
@@ -403,32 +380,8 @@ func (m *Manager) RestartAndGetDataKey(onStatus func(string)) error {
 	}
 	m.ctx.Refresh()
 	m.ctx.UpdateConfig()
-
 	log.Info().Msg("Successfully got key from new WeChat process.")
 	return nil
-}
-
-func normalizeKeyAcquireError(err error) error {
-	if err == nil {
-		return nil
-	}
-	msg := strings.ToLower(err.Error())
-	if strings.Contains(msg, "scan memory failed") || strings.Contains(msg, "task_for_pid") || strings.Contains(msg, "code=-2") {
-		return fmt.Errorf(
-			"获取密钥失败：macOS 进程内存读取权限不足（task_for_pid）。\n"+
-				"请按以下步骤（参考 wx-cli）处理后重试：\n"+
-				"1) 对 WeChat 做 ad-hoc 签名（只需一次，升级微信后需重做）:\n"+
-				"   codesign --force --deep --sign - /Applications/WeChat.app\n"+
-				"2) 重启微信并完成登录:\n"+
-				"   killall WeChat && open /Applications/WeChat.app\n"+
-				"3) 使用管理员权限启动本程序后再点“重启并获取密钥”:\n"+
-				"   sudo -E go run .\n"+
-				"若 codesign 报 \"signature in use\"，先执行:\n"+
-				"   codesign --remove-signature /Applications/WeChat.app/Contents/Frameworks/vlc_plugins/librtp_mpeg4_plugin.dylib\n"+
-				"   codesign --force --deep --sign - /Applications/WeChat.app\n"+
-				"原始错误: %w", err)
-	}
-	return err
 }
 
 func isRetryableKeyErr(err error) bool {
@@ -443,42 +396,17 @@ func isRetryableKeyErr(err error) bool {
 		return true
 	case strings.Contains(msg, "初始化"):
 		return true
-	case strings.Contains(msg, "未找到可用的 message_0.db data key"):
-		return true
 	case strings.Contains(msg, "未找到 all_keys.json"):
 		return true
 	case strings.Contains(msg, "all_keys.json 为空"):
 		return true
-	case strings.Contains(msg, "内存扫描未发现候选 key/salt"):
+	case strings.Contains(msg, "frida"):
 		return true
-	case strings.Contains(msg, "扫描到候选 key，但未匹配到任意数据库 salt"):
-		return true
-	case strings.Contains(msg, "未命中"):
+	case strings.Contains(msg, "未捕获到密钥"):
 		return true
 	default:
 		return false
 	}
-}
-
-func isDarwinPermissionErr(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "task_for_pid") ||
-		strings.Contains(msg, "scan memory failed") ||
-		strings.Contains(msg, "code=-2")
-}
-
-func isDarwinScanStageErr(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "内存扫描") ||
-		strings.Contains(msg, "all_keys.json") ||
-		strings.Contains(msg, "未匹配到任意数据库 salt") ||
-		strings.Contains(msg, "未找到可用的 message_0.db")
 }
 
 func pickBestWeChatInstance(instances []*iwechat.Account, exePath, platform string) *iwechat.Account {
@@ -493,7 +421,6 @@ func pickBestWeChatInstance(instances []*iwechat.Account, exePath, platform stri
 		if exePath != "" && inst.ExePath != exePath {
 			continue
 		}
-		// 优先有 DataDir 的实例；同等条件下选 PID 更大的（通常是最新进程）
 		if best == nil {
 			best = inst
 			continue
@@ -509,83 +436,6 @@ func pickBestWeChatInstance(instances []*iwechat.Account, exePath, platform stri
 		}
 	}
 	return best
-}
-
-func isDarwinLoginReady(current *iwechat.Account, restartedAt time.Time) bool {
-	_ = restartedAt
-	if current == nil {
-		return false
-	}
-	// 优先对齐 Windows 的登录判定方式：
-	// 通过目标 PID 的 OpenFiles 检测 session.db 是否被进程打开。
-	if current.PID != 0 {
-		if ok, known := isProcessOpenedSessionDB(current.PID); known {
-			return ok
-		}
-	}
-	// 严格模式：未确认打开 session.db 即视为未登录。
-	return false
-}
-
-// isProcessOpenedSessionDB returns:
-//
-//	ok    -> whether session.db is opened by target process
-//	known -> whether OpenFiles probing is supported and succeeded
-func isProcessOpenedSessionDB(pid uint32) (ok bool, known bool) {
-	cmd := exec.Command("lsof", "-n", "-P", "-p", strconv.Itoa(int(pid)), "-F", "n")
-	out, err := cmd.Output()
-	if err != nil {
-		return false, false
-	}
-	for _, line := range strings.Split(string(out), "\n") {
-		if len(line) <= 1 || line[0] != 'n' {
-			continue
-		}
-		path := strings.ReplaceAll(strings.ToLower(strings.TrimSpace(line[1:])), "\\", "/")
-		if strings.HasSuffix(path, "/db_storage/session/session.db") {
-			return true, true
-		}
-	}
-	return false, true
-}
-
-func tryDarwinPrivilegedKeyHelper(current *iwechat.Account) (string, error) {
-	if current == nil {
-		return "", fmt.Errorf("账号为空")
-	}
-	if current.PID == 0 || current.DataDir == "" {
-		return "", fmt.Errorf("微信进程信息不完整，无法提权获取密钥")
-	}
-
-	exePath, err := os.Executable()
-	if err != nil {
-		return "", fmt.Errorf("获取可执行文件路径失败: %w", err)
-	}
-
-	cmd := fmt.Sprintf("%q mac-key-helper --pid %d --data-dir %q", exePath, current.PID, current.DataDir)
-	script := fmt.Sprintf("do shell script \"%s\" with administrator privileges", escapeAppleScript(cmd))
-
-	out, err := exec.Command("osascript", "-e", script).CombinedOutput()
-	if err != nil {
-		return "", fmt.Errorf("管理员提权执行失败: %v, 输出: %s", err, strings.TrimSpace(string(out)))
-	}
-
-	key := strings.TrimSpace(string(out))
-	key = strings.Split(key, "\n")[0]
-	if len(key) != 64 {
-		return "", fmt.Errorf("管理员提权返回密钥长度异常: %d", len(key))
-	}
-	if _, err := hex.DecodeString(key); err != nil {
-		return "", fmt.Errorf("管理员提权返回无效密钥: %w", err)
-	}
-	current.Key = strings.ToLower(key)
-	return current.Key, nil
-}
-
-func escapeAppleScript(s string) string {
-	s = strings.ReplaceAll(s, "\\", "\\\\")
-	s = strings.ReplaceAll(s, "\"", "\\\"")
-	return s
 }
 
 func startWeChatProcess(platform, exePath string) error {

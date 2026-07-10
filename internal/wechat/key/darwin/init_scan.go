@@ -2,7 +2,6 @@ package darwin
 
 import (
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -25,83 +24,8 @@ type dbSaltEntry struct {
 	DBRel   string
 }
 
-// InitAllKeysByPID implements wx-cli style flow:
-// 1) collect db salts under db_storage
-// 2) scan process memory for x'<64hex_key><32hex_salt>'
-// 3) match salt to db and write all_keys.json
-// 4) return preferred data key (message_0 first, fallback first key)
-func InitAllKeysByPID(pid uint32, dataDir string, status func(string)) (string, int, error) {
-	if pid == 0 {
-		return "", 0, fmt.Errorf("invalid pid")
-	}
-	if dataDir == "" {
-		return "", 0, fmt.Errorf("invalid dataDir")
-	}
-
-	accountDir, dbStorageDir := resolveDBDirs(dataDir)
-	dbSalts, err := collectDBSalts(dbStorageDir)
-	if err != nil {
-		return "", 0, err
-	}
-	if len(dbSalts) == 0 {
-		return "", 0, fmt.Errorf("未找到可用加密数据库（db_storage）")
-	}
-	if status != nil {
-		status(fmt.Sprintf("已收集加密数据库 salt：%d 个", len(dbSalts)))
-	}
-
-	pairs, err := scanKeySaltPairsByPID(pid)
-	if err != nil {
-		return "", 0, err
-	}
-	if len(pairs) == 0 {
-		return "", 0, fmt.Errorf("内存扫描未发现候选 key/salt")
-	}
-	if status != nil {
-		status(fmt.Sprintf("内存扫描完成：候选 key/salt %d 组", len(pairs)))
-	}
-
-	// Match key/salt pairs against collected db salts.
-	// Keep all DBs that share the same salt so we can prefer message DB keys later.
-	out := map[string]keyFileEntry{}
-	for _, pair := range pairs {
-		for _, ds := range dbSalts {
-			if pair.SaltHex != ds.SaltHex {
-				continue
-			}
-			if _, exists := out[ds.DBRel]; !exists {
-				out[ds.DBRel] = keyFileEntry{EncKey: strings.ToLower(pair.KeyHex)}
-			}
-		}
-	}
-	if len(out) == 0 {
-		return "", 0, fmt.Errorf("扫描到候选 key，但未匹配到任意数据库 salt")
-	}
-
-	keysPath := filepath.Join(accountDir, "all_keys.json")
-	raw, err := json.MarshalIndent(out, "", "  ")
-	if err != nil {
-		return "", 0, fmt.Errorf("序列化 all_keys.json 失败: %w", err)
-	}
-	if err := os.WriteFile(keysPath, raw, 0600); err != nil {
-		return "", 0, fmt.Errorf("写入 %s 失败: %w", keysPath, err)
-	}
-	if err := normalizeAllKeysOwnership(keysPath); err != nil && status != nil {
-		status(fmt.Sprintf("警告：all_keys.json 权限归一化失败：%v", err))
-	}
-	if status != nil {
-		status(fmt.Sprintf("已写入 all_keys.json：%s（%d 条）", keysPath, len(out)))
-	}
-
-	key, err := loadAndValidateMessageKey(accountDir, status)
-	if err != nil {
-		return "", len(out), err
-	}
-	return key, len(out), nil
-}
-
-// loadAndValidateMessageKey keeps original method name for compatibility,
-// but follows wx-cli usage: pick key from all_keys.json without hard DB-page validation.
+// loadAndValidateMessageKey picks a usable data key from all_keys.json
+// (written by Frida extraction). No process memory scan.
 func loadAndValidateMessageKey(dataDir string, status func(string)) (string, error) {
 	keys, err := loadAllKeys(dataDir)
 	if err != nil {

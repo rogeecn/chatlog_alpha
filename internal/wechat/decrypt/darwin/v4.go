@@ -4,6 +4,9 @@ import (
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/hmac"
+	"crypto/sha512"
+	"encoding/binary"
 	"encoding/hex"
 	"hash"
 	"io"
@@ -11,13 +14,19 @@ import (
 
 	"github.com/sjzar/chatlog/internal/errors"
 	"github.com/sjzar/chatlog/internal/wechat/decrypt/common"
+	"golang.org/x/crypto/pbkdf2"
 )
 
 const (
 	PageSize     = 4096
-	ReserveSize  = 80 // IV(16) + HMAC(64)
+	ReserveSize  = 80 // IV(16) + HMAC-SHA512(64)
 	SaltSize     = 16
 	AESBlockSize = 16
+	IVSize       = 16
+	HMACSize     = 64
+	// WeChat 4.x / SQLCipher 4 defaults
+	KDFIter    = 256000
+	MacKDFIter = 2
 )
 
 type V4Decryptor struct{}
@@ -50,6 +59,24 @@ func (d *V4Decryptor) Decrypt(ctx context.Context, dbfile string, hexKey string,
 		return errors.ErrDecryptIncorrectKey
 	}
 
+	// Salt lives in page 1; derive once then reuse for all pages.
+	first := make([]byte, PageSize)
+	if _, err := io.ReadFull(dbFile, first); err != nil {
+		return errors.ReadFileFailed(dbfile, err)
+	}
+	salt := first[:SaltSize]
+	encKey, _, err := d.DeriveKeys(key, salt)
+	if err != nil {
+		return err
+	}
+	if !d.Validate(first, key) {
+		return errors.ErrDecryptIncorrectKey
+	}
+
+	if _, err := dbFile.Seek(0, io.SeekStart); err != nil {
+		return errors.ReadFileFailed(dbfile, err)
+	}
+
 	page := make([]byte, PageSize)
 	for pg := 0; pg < totalPages; pg++ {
 		select {
@@ -72,7 +99,7 @@ func (d *V4Decryptor) Decrypt(ctx context.Context, dbfile string, hexKey string,
 			}
 		}
 
-		dec, err := decryptPage(page, key, pg+1)
+		dec, err := decryptPage(page, encKey, pg+1)
 		if err != nil {
 			return err
 		}
@@ -84,15 +111,48 @@ func (d *V4Decryptor) Decrypt(ctx context.Context, dbfile string, hexKey string,
 	return nil
 }
 
+// Validate checks that password derives a usable SQLCipher page-1 key.
+// WeChat 4.x stores a 32-byte passphrase; real enc_key = PBKDF2-HMAC-SHA512(pass, salt, 256000).
+// Page-1 HMAC is unreliable across builds, so we verify decrypted SQLite header fields.
 func (d *V4Decryptor) Validate(page1 []byte, key []byte) bool {
 	if len(page1) < PageSize || len(key) != common.KeySize {
 		return false
 	}
-	dec, err := decryptPage(page1[:PageSize], key, 1)
-	if err != nil || len(dec) < len(common.SQLiteHeader) {
+	if string(page1[:15]) == "SQLite format 3" {
+		return false // already plaintext / not encrypted
+	}
+	salt := page1[:SaltSize]
+	encKey, _, err := d.DeriveKeys(key, salt)
+	if err != nil {
 		return false
 	}
-	return string(dec[:len(common.SQLiteHeader)]) == common.SQLiteHeader
+	dec, err := decryptPage(page1[:PageSize], encKey, 1)
+	if err != nil || len(dec) < 100 {
+		return false
+	}
+	if string(dec[:len(common.SQLiteHeader)]) != common.SQLiteHeader {
+		return false
+	}
+	pageSz := binary.BigEndian.Uint16(dec[16:18])
+	if pageSz != PageSize && pageSz != 1 { // 1 means 65536 in SQLite
+		return false
+	}
+	writeVer, readVer := dec[18], dec[19]
+	if writeVer > 2 || readVer > 2 || writeVer == 0 || readVer == 0 {
+		return false
+	}
+	// reserved space should match SQLCipher reserve (IV+HMAC)
+	if dec[20] != byte(ReserveSize) && dec[20] != 0 {
+		// WeChat writes reserve=80; accept 0 only if other fields look sane.
+		if pageSz != PageSize {
+			return false
+		}
+	}
+	textEnc := binary.BigEndian.Uint32(dec[56:60])
+	if textEnc != 1 && textEnc != 2 && textEnc != 3 {
+		return false
+	}
+	return true
 }
 
 func (d *V4Decryptor) GetPageSize() int {
@@ -104,39 +164,44 @@ func (d *V4Decryptor) GetReserve() int {
 }
 
 func (d *V4Decryptor) GetHMACSize() int {
-	return 64
+	return HMACSize
 }
 
 func (d *V4Decryptor) GetHashFunc() func() hash.Hash {
-	return nil
+	return sha512.New
 }
 
+// DeriveKeys derives SQLCipher 4 enc_key and mac_key from the 32-byte passphrase.
 func (d *V4Decryptor) DeriveKeys(key []byte, salt []byte) ([]byte, []byte, error) {
-	_ = salt
 	if len(key) != common.KeySize {
 		return nil, nil, errors.ErrKeyLengthMust32
 	}
-	enc := make([]byte, len(key))
-	copy(enc, key)
-	return enc, nil, nil
+	if len(salt) < SaltSize {
+		return nil, nil, errors.ErrDecryptIncorrectKey
+	}
+	salt = salt[:SaltSize]
+	encKey := pbkdf2.Key(key, salt, KDFIter, common.KeySize, sha512.New)
+	macSalt := common.XorBytes(salt, 0x3a)
+	macKey := pbkdf2.Key(encKey, macSalt, MacKDFIter, common.KeySize, sha512.New)
+	return encKey, macKey, nil
 }
 
 func (d *V4Decryptor) GetVersion() string {
-	return "Darwin v4 (wx-cli compatible)"
+	return "Darwin v4 (SQLCipher4 PBKDF2-HMAC-SHA512)"
 }
 
-func decryptPage(pageData []byte, key []byte, pgno int) ([]byte, error) {
-	if len(pageData) < PageSize || len(key) != common.KeySize {
+func decryptPage(pageData []byte, encKey []byte, pgno int) ([]byte, error) {
+	if len(pageData) < PageSize || len(encKey) != common.KeySize {
 		return nil, errors.ErrDecryptIncorrectKey
 	}
 	ivOffset := PageSize - ReserveSize
-	iv := pageData[ivOffset : ivOffset+16]
+	iv := pageData[ivOffset : ivOffset+IVSize]
 
 	result := make([]byte, PageSize)
 
 	if pgno == 1 {
 		enc := pageData[SaltSize : PageSize-ReserveSize]
-		dec, err := aesCBCDecrypt(key, iv, enc)
+		dec, err := aesCBCDecrypt(encKey, iv, enc)
 		if err != nil {
 			return nil, err
 		}
@@ -146,7 +211,7 @@ func decryptPage(pageData []byte, key []byte, pgno int) ([]byte, error) {
 	}
 
 	enc := pageData[:PageSize-ReserveSize]
-	dec, err := aesCBCDecrypt(key, iv, enc)
+	dec, err := aesCBCDecrypt(encKey, iv, enc)
 	if err != nil {
 		return nil, err
 	}
@@ -167,4 +232,15 @@ func aesCBCDecrypt(key []byte, iv []byte, data []byte) ([]byte, error) {
 	mode := cipher.NewCBCDecrypter(block, iv)
 	mode.CryptBlocks(out, out)
 	return out, nil
+}
+
+// PageHMAC computes SQLCipher HMAC for debugging/tests (page_no is 1-based).
+func PageHMAC(macKey, page []byte, pageNo uint32) []byte {
+	dataEnd := PageSize - ReserveSize + IVSize
+	mac := hmac.New(sha512.New, macKey)
+	mac.Write(page[:dataEnd])
+	var pn [4]byte
+	binary.LittleEndian.PutUint32(pn[:], pageNo)
+	mac.Write(pn[:])
+	return mac.Sum(nil)
 }

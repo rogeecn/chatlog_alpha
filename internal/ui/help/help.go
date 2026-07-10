@@ -29,9 +29,10 @@ const (
    这一步的目的是将手机中的聊天记录传输到电脑上。
    可以放心操作，不会影响到手机上的聊天记录。
 
-[yellow]3. 解密数据[white]
-   重新打开 chatlog，选择"解密数据"菜单项，程序会使用获取的密钥解密微信数据库文件。
-   macOS V4 下优先使用 all_keys.json + 内置查询链路，无需依赖工作目录。
+[yellow]3. 获取密钥并解密数据[white]
+   macOS 数据库密钥 [yellow]仅支持 Frida[white]：先 [yellow]pip3 install frida-tools[white]，
+   再选「重启并获取密钥」或命令行 [yellow]chatlog key[white]（Hook CCKeyDerivationPBKDF）。
+   之后选择"解密数据"。密钥会写入 all_keys.json 供查询链路使用。
 
 [yellow]4. 启动 HTTP 服务[white]
    选择"启动 HTTP 服务"菜单项，启动 HTTP 和 MCP 服务。

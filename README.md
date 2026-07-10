@@ -2,9 +2,20 @@
 
 微信 4.x 聊天记录本地查询工具，支持 `macOS` 与 `Windows`。
 
-> 警告：Windows 平台当前未完成实机测试，可能无法正常运行。请优先在测试环境验证后再用于正式数据。
+> **当前 macOS 实机验证微信版本：`4.1.11.54`（Mac 版）**。其他版本未保证可用。  
+>
+> **Windows 用户请注意：** 当前 Windows 仍使用**进程内存扫描**提取 data key，**未完成充分实机测试，不保证能正常工作**。请优先在测试环境验证。  
+> 若你在 Windows 上使用：无论成功或失败，都欢迎通过 [GitHub Issues](https://github.com/teest114514/chatlog_alpha/issues) **反馈结果**（微信版本、是否提 key 成功、报错信息等），以便评估是否将 Windows 也升级为 **Frida Hook** 方式（与 macOS 对齐）。
 
 ## 更新日志（近期）
+
+### 2026-07-10
+
+- macOS 数据库密钥（data key）**仅支持 Frida Hook** `CCKeyDerivationPBKDF`；已移除 data key 内存扫描实现。
+- 默认用 LaunchServices `open -a WeChat` 拉起微信后再 attach，保留沙盒用户数据（避免 `frida.spawn` 裸二进制导致空账号）。
+- 解密链路改为 SQLCipher4：`PBKDF2-HMAC-SHA512`（256000 轮）派生后 AES-CBC 解页。
+- 新增 CLI：`chatlog key`；TUI「重启并获取密钥」走同一 Frida 路径。
+- 当前文档标注可运行微信版本为 **Mac 版 4.1.11.54**。
 
 ### 2026-04-26
 
@@ -81,18 +92,110 @@
 
 ## 平台与能力
 
-- 数据库 Key 获取：内置扫描流程（兼容 `all_keys.json`）
-- 图片 Key 获取：内置扫描与校验流程
-- 数据查询：HTTP + MCP（wx-cli 风格接口）
-- 数据源：内置 `wcdb_api` 兼容查询链路（非外部 DLL）
-- 全局搜索：支持跨所有数据库快速搜索 / 深度搜索
-- 朋友圈媒体：支持图片、视频、实况图代理解密
-- 关键词推送：前端/TUI 同步配置，支持 MCP 主动推送与 POST 通知
-  - 也支持推送到 Hermes Agent 的微信 home channel
-  - 也支持推送到 Hermes Agent 的 QQ home channel
-- 推送事件：支持持久化保存、启动恢复与一键清理
-- 时间知识图谱：支持业务/事件推送、聊天消息抽取、关系演化、证据链、时间线和图谱问答
+| 能力 | macOS | Windows |
+|------|--------|---------|
+| 微信版本（已验证） | **Mac 4.1.11.54** | 未充分实机验证 |
+| 数据库 data key | **仅 Frida** Hook `CCKeyDerivationPBKDF` → `all_keys.json` | 进程内存扫描 → `all_keys.json` |
+| 图片 key | 内存扫描 / kvcomm 推导 | 内存扫描 |
+| 数据查询 | HTTP + MCP | HTTP + MCP |
+| 数据源 | 内置 `wcdb_api` 兼容链路 | 同左（实验性） |
 
+其他能力：
+
+- 全局搜索：跨库快速搜索 / 深度搜索
+- 朋友圈媒体：图片、视频、实况图代理解密
+- 关键词推送：前端/TUI，MCP / POST / Hermes 微信 / Hermes QQ
+- 时间知识图谱：业务/事件推送、聊天抽取、关系演化、证据链、时间线与图谱问答
+
+## 兼容微信版本
+
+| 平台 | 版本 | 说明 |
+|------|------|------|
+| **macOS** | **4.1.11.54** | 当前仓库 data key（Frida）与解密链路的**已验证**版本 |
+| macOS | 其他 4.x | 未保证；微信升级后 PBKDF/布局可能变化 |
+| Windows | 4.x | 仍为内存扫描，**未保证可用**；欢迎 [Issue 反馈](https://github.com/teest114514/chatlog_alpha/issues) 是否需改 Frida |
+
+查看本机微信版本（macOS）：
+
+```bash
+defaults read /Applications/WeChat.app/Contents/Info.plist CFBundleShortVersionString
+# 或
+/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' /Applications/WeChat.app/Contents/Info.plist
+```
+
+## macOS 数据库密钥提取（Frida only）
+
+macOS 上 **唯一** 的 data key 获取方式：
+
+1. 结束当前微信  
+2. 用 LaunchServices **`open -a WeChat`** 正常启动（挂上沙盒容器，保留原账号数据）  
+3. Frida **尽快 attach**，Hook 系统库 `CCKeyDerivationPBKDF`  
+4. 在自动登录 / 打开数据库时捕获 32 字节 passphrase，写入 `all_keys.json`  
+
+解密使用 SQLCipher4：`PBKDF2-HMAC-SHA512`（256000 轮）派生后 AES-CBC 解页。
+
+> **不要**对微信二进制直接 `frida.spawn`：会绕过沙盒，常见现象是「全新微信 / 无原用户数据」。  
+> 程序默认已使用 `--mode open`；仅调试可设 `CHATLOG_FRIDA_MODE=spawn`（有丢数据环境风险）。
+
+### 正确安装 Frida（必读）
+
+chatlog **不内置** Frida，依赖本机 Python 的 `frida` 包。请用**当前登录用户**安装（**不要** `sudo pip`，避免装到 root 环境而 chatlog 以普通用户跑找不到包）。
+
+```bash
+# 1) 确认 Python 3（系统自带或 Homebrew 均可）
+python3 --version
+
+# 2) 安装到当前用户（推荐）
+python3 -m pip install --user -U frida-tools
+
+# 3) 验证：必须能 import，且版本建议 >= 17
+python3 -c "import frida; print('frida', frida.__version__)"
+```
+
+若 `import frida` 失败，按下面排查：
+
+| 现象 | 处理 |
+|------|------|
+| `ModuleNotFoundError: frida` | 确认 `python3 -m pip install --user frida-tools`；同一 `python3` 执行 `import frida` |
+| `pip` / `frida` 命令不在 PATH | 不影响：chatlog 用的是 `python3 -c "import frida"`，**不依赖** `frida` CLI 是否在 PATH |
+| 用了 `sudo pip install` | 卸载 root 包或改用 `--user`；用普通用户重新 `python3 -c "import frida"` |
+| 多个 Python（Homebrew / pyenv） | 保证 **chatlog 调用的 `python3`** 与安装 Frida 的是同一个：`which python3` |
+| 公司代理 / SSL | 配置 pip 镜像后再装，例如：`python3 -m pip install --user -U frida-tools -i https://pypi.org/simple` |
+
+可选：若希望脚本路径固定，可设置：
+
+```bash
+export CHATLOG_FRIDA_SCRIPT=/path/to/chatlog_alpha/scripts/wechat_key_frida.py
+```
+
+未设置时，会依次查找仓库 `scripts/wechat_key_frida.py`，否则使用二进制内嵌脚本。
+
+### 用法
+
+```bash
+# 构建
+make build   # 或: go build -o bin/chatlog .
+
+# 提取密钥（会结束当前微信，再 open -a 拉起原账号环境；请随后登录或等待自动登录）
+./bin/chatlog key
+
+# 仅输出 64 位 hex，便于脚本
+./bin/chatlog key --json
+
+# 指定账号数据目录，捕获后写入 all_keys.json
+./bin/chatlog key --data-dir ~/Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files/<账号目录>
+
+# 独立脚本（默认 --mode open，与 chatlog 一致）
+python3 scripts/wechat_key_frida.py --timeout 180
+```
+
+TUI：菜单 **「重启并获取密钥」** → 同一 Frida 路径。
+
+### 注意事项
+
+- 使用 **当前登录用户** 运行 chatlog / 脚本，**避免 `sudo ./bin/chatlog key`**（否则微信可能落到 `/var/root` 容器，表现为空账号）。
+- 抓 key 时请保证微信能完成登录；若超时无输出，登录后**打开任意聊天**再试，或加大超时：`./bin/chatlog key --timeout 300`。
+- 图片密钥仍可能走进程内存扫描（与 data key 无关）；仅获取图片 key 时若权限不足，再考虑管理员权限（见下文）。
 
 ## GitHub 自动构建产物
 
@@ -156,31 +259,48 @@ Skill 文档：`skills/chatlog-http-cli/SKILL.md`
 
 ## macOS 权限说明（务必阅读）
 
-### 1) 推荐用 `sudo` 运行
+### data key（Frida）
 
-macOS 内存读取依赖 `task_for_pid`，建议以 root 启动程序。
+- **不需要** `sudo` / 关闭 SIP / `task_for_pid` 提权。  
+- 需要：本机已正确安装 Frida（见上文「正确安装 Frida」）。  
+- 请用**登录用户**运行；`sudo` 反而容易导致微信用户数据目录错误。
 
-### 2) 若使用 setuid 方案（可执行文件自动 root）
+### 图片 key / 进程内存读取（可选能力）
 
-请在每次重新编译后执行：
+图片密钥若走内存扫描，仍依赖 `task_for_pid`。仅在「获取图片密钥」失败且提示权限不足时，再考虑：
+
+1. 以管理员权限启动（注意：与 data key 的 Frida 路径分开使用，避免长期 `sudo` 跑主程序）。  
+2. 或对可执行文件使用 setuid（每次重新编译后需重做）：
 
 ```bash
 BIN_PATH="/你的实际路径/chatlog"
 sudo chown root:wheel "$BIN_PATH"
 sudo chmod 4755 "$BIN_PATH"
-ls -l "$BIN_PATH"
+ls -l "$BIN_PATH"   # 期望看到 -rwsr-xr-x
 ```
 
-看到 `-rwsr-xr-x` 表示生效。
+3. 部分系统上稳定读进程内存可能还受 SIP 限制；**仅 data key 时无需关闭 SIP**。
 
-### 3) SIP
+## Windows 说明与反馈（重要）
 
-在多数机器上，仅 root 仍可能不足以读取微信进程内存。  
-如需稳定扫描 Key，通常还需要关闭 SIP（System Integrity Protection）。
+当前 Windows 与 macOS **提 key 路径不一致**：
 
-## Windows 权限说明
+| 项 | 现状 |
+|----|------|
+| data key | **进程内存扫描**（非 Frida） |
+| 实机测试 | **未充分验证，不保证正常工作** |
+| 权限 | 建议**以管理员身份**运行，否则可能无法读微信进程内存 |
 
-- 请使用“管理员权限”启动程序，否则可能无法读取微信进程内存。
+**请 Windows 用户反馈：**
+
+1. 当前内存扫描方式在你的环境是否**工作正常**（提 key / 解密 / 查询）？  
+2. 是否希望 Windows 也改为与 macOS 相同的 **Frida Hook** 方案？  
+
+反馈请到仓库 Issues（附微信版本、系统版本、成功/失败与日志摘要）：
+
+→ [https://github.com/teest114514/chatlog_alpha/issues](https://github.com/teest114514/chatlog_alpha/issues)
+
+收到足够反馈后，会再决定是否把 Windows data key 更新为 Frida 方式。
 
 ## HTTP 接口（摘要）
 
