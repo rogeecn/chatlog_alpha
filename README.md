@@ -113,6 +113,11 @@ xattr -d com.apple.quarantine chatlog-darwin-arm64 2>/dev/null || true
 权限，解压后可以直接运行。若终端提示 `permission denied`，重新执行
 `chmod 755 chatlog-darwin-arm64` 即可。
 
+macOS 压缩包同时提供 `start-chatlog.command`。解压后在 Finder 中双击该文件，
+系统会自动打开终端并启动 Chatlog。启动文件会定位同目录的对应架构二进制、
+恢复其执行权限并清理二进制的下载隔离标记。首次启动若出现系统确认窗口，
+可在 Finder 中右键 `start-chatlog.command`，选择“打开”。
+
 不知道 macOS 架构时可执行：
 
 ```bash
@@ -151,6 +156,14 @@ unzip chatlog_*_darwin_arm64.zip
 chmod +x chatlog-darwin-arm64
 ./chatlog-darwin-arm64
 ```
+
+也可以解压后在 Finder 中双击：
+
+```text
+start-chatlog.command
+```
+
+该启动文件会打开终端并运行同目录下的 `chatlog-darwin-arm64`。
 
 ### 4. 按 TUI 步骤操作
 
