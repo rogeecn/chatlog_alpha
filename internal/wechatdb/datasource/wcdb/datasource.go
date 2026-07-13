@@ -131,13 +131,7 @@ func (ds *DataSource) GetMessages(ctx context.Context, startTime, endTime time.T
 
 	perTalkerLimit := 0
 	if limit > 0 {
-		perTalkerLimit = (limit + offset) * 5
-		if perTalkerLimit < 1000 {
-			perTalkerLimit = 1000
-		}
-		if perTalkerLimit > 50000 {
-			perTalkerLimit = 50000
-		}
+		perTalkerLimit = messageQueryFetchLimit(limit, offset, sender != "" || keyword != "")
 	}
 
 	out := make([]*model.Message, 0, perTalkerLimit*len(talkers))
@@ -217,6 +211,31 @@ func (ds *DataSource) GetMessages(ctx context.Context, startTime, endTime time.T
 		return out[offset:], nil
 	}
 	return out, nil
+}
+
+func messageQueryFetchLimit(limit, offset int, hasPostFilter bool) int {
+	if limit <= 0 {
+		return 0
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	const maxRequestedBeforeMultiplier = 50000 / 5
+	if offset >= maxRequestedBeforeMultiplier || limit >= maxRequestedBeforeMultiplier-offset {
+		return 50000
+	}
+	fetchLimit := (limit + offset) * 5
+	minimum := 20
+	if hasPostFilter {
+		minimum = 1000
+	}
+	if fetchLimit < minimum {
+		fetchLimit = minimum
+	}
+	if fetchLimit > 50000 {
+		fetchLimit = 50000
+	}
+	return fetchLimit
 }
 
 func (ds *DataSource) GetMessage(ctx context.Context, talker string, seq int64) (*model.Message, error) {
@@ -346,20 +365,14 @@ func (ds *DataSource) GetMedia(ctx context.Context, _type, key string) (*model.M
 		return &model.Media{Type: "voice", Key: key, Data: data}, nil
 	}
 
-	table := "image_hardlink_info_v4"
-	switch _type {
-	case "image":
-		table = "image_hardlink_info_v4"
-	case "video":
-		table = "video_hardlink_info_v4"
-	case "file":
-		table = "file_hardlink_info_v4"
-	default:
-		return nil, errors.MediaTypeUnsupported(_type)
+	table, err := hardlinkTableForMediaType(_type)
+	if err != nil {
+		return nil, err
 	}
 	sql := fmt.Sprintf(`
 SELECT
 	f.md5,
+	f.type AS hardlink_type,
 	f.file_name,
 	f.file_size,
 	f.modify_time,
@@ -375,8 +388,63 @@ WHERE f.md5 = %s OR f.file_name LIKE %s || '%%'
 	if err != nil || len(rows) == 0 {
 		return nil, errors.ErrMediaNotFound
 	}
+	return mediaFromHardlinkRows(_type, rows)
+}
+
+func (ds *DataSource) GetMediaByName(ctx context.Context, mediaType, name string, size int64) (*model.Media, error) {
+	_ = ctx
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return nil, errors.ErrKeyEmpty
+	}
+	table, err := hardlinkTableForMediaType(mediaType)
+	if err != nil {
+		return nil, err
+	}
+	sql := fmt.Sprintf(`
+SELECT
+	f.md5,
+	f.type AS hardlink_type,
+	f.file_name,
+	f.file_size,
+	f.modify_time,
+	f.extra_buffer,
+	IFNULL(d1.username,"") AS dir1,
+	IFNULL(d2.username,"") AS dir2
+FROM %s f
+LEFT JOIN dir2id d1 ON d1.rowid = f.dir1
+LEFT JOIN dir2id d2 ON d2.rowid = f.dir2
+WHERE f.file_name = %s
+`, table, strconv.Quote(name))
+	if size > 0 {
+		sql += fmt.Sprintf(" AND f.file_size = %d", size)
+	}
+	rows, err := ds.client.Query("media", "", sql)
+	if err != nil || len(rows) == 0 {
+		return nil, errors.ErrMediaNotFound
+	}
+	return mediaFromHardlinkRows(mediaType, rows)
+}
+
+func hardlinkTableForMediaType(mediaType string) (string, error) {
+	switch mediaType {
+	case "image":
+		return "image_hardlink_info_v4", nil
+	case "video":
+		return "video_hardlink_info_v4", nil
+	case "file":
+		return "file_hardlink_info_v4", nil
+	default:
+		return "", errors.MediaTypeUnsupported(mediaType)
+	}
+}
+
+func mediaFromHardlinkRows(mediaType string, rows []map[string]interface{}) (*model.Media, error) {
+	if len(rows) == 0 {
+		return nil, errors.ErrMediaNotFound
+	}
 	best := rows[0]
-	switch _type {
+	switch mediaType {
 	case "image":
 		best = bestImageRow(rows)
 	case "video":
@@ -385,14 +453,15 @@ WHERE f.md5 = %s OR f.file_name LIKE %s || '%%'
 		best = bestFileRow(rows)
 	}
 	mv4 := model.MediaV4{
-		Type:        _type,
-		Key:         toString(best["md5"]),
-		Name:        toString(best["file_name"]),
-		Size:        toInt64(best["file_size"]),
-		ModifyTime:  toInt64(best["modify_time"]),
-		ExtraBuffer: toString(best["extra_buffer"]),
-		Dir1:        toString(best["dir1"]),
-		Dir2:        toString(best["dir2"]),
+		Type:         mediaType,
+		Key:          toString(best["md5"]),
+		Name:         toString(best["file_name"]),
+		Size:         toInt64(best["file_size"]),
+		ModifyTime:   toInt64(best["modify_time"]),
+		ExtraBuffer:  toString(best["extra_buffer"]),
+		Dir1:         toString(best["dir1"]),
+		Dir2:         toString(best["dir2"]),
+		HardLinkType: toInt64(best["hardlink_type"]),
 	}
 	return mv4.Wrap(), nil
 }

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -20,6 +21,13 @@ import (
 	"github.com/sjzar/chatlog/internal/model"
 	"github.com/sjzar/chatlog/pkg/version"
 )
+
+const (
+	compatEndpointTimeout          = 5 * time.Minute
+	maxCompatEndpointResponseBytes = 64 * 1024 * 1024
+)
+
+var compatEndpointHTTPClient = &http.Client{Timeout: compatEndpointTimeout}
 
 func (s *Service) initMCPServer() {
 	s.mcpServer = server.NewMCPServer(conf.AppName, version.Version,
@@ -37,6 +45,7 @@ func (s *Service) initMCPServer() {
 	s.mcpServer.AddTool(WxSessionsTool, s.handleMCPWxSessions)
 	s.mcpServer.AddTool(WxHistoryTool, s.handleMCPWxHistory)
 	s.mcpServer.AddTool(WxSearchTool, s.handleMCPWxSearch)
+	s.mcpServer.AddTool(WxSemanticSearchTool, s.handleMCPWxSemanticSearch)
 	s.mcpServer.AddTool(WxUnreadTool, s.handleMCPWxUnread)
 	s.mcpServer.AddTool(WxMembersTool, s.handleMCPWxMembers)
 	s.mcpServer.AddTool(WxNewMessagesTool, s.handleMCPWxNewMessages)
@@ -147,6 +156,16 @@ var WxSearchTool = mcp.NewTool(
 	mcp.WithString("since", mcp.Description("开始时间戳（秒）")),
 	mcp.WithString("until", mcp.Description("结束时间戳（秒）")),
 	mcp.WithNumber("msg_type", mcp.Description("消息类型")),
+)
+var WxSemanticSearchTool = mcp.NewTool(
+	"wx_semantic_search",
+	mcp.WithDescription("语义检索（向量索引）：支持跨会话和长时间窗口的自然语言相关消息检索。"),
+	mcp.WithString("query", mcp.Description("自然语言查询"), mcp.Required()),
+	mcp.WithString("chats", mcp.Description("逗号分隔的会话标识；省略时检索全部已索引会话")),
+	mcp.WithString("window", mcp.Description("时间窗口：1d/7d/30d/90d/1y/all")),
+	mcp.WithNumber("limit", mcp.Description("返回条数")),
+	mcp.WithString("depth", mcp.Description("检索深度：shallow/normal/deep")),
+	mcp.WithBoolean("rerank", mcp.Description("是否启用二次排序")),
 )
 var WxUnreadTool = mcp.NewTool(
 	"wx_unread",
@@ -337,8 +356,8 @@ type SearchSharedFilesRequest struct {
 	Keyword string `json:"keyword"`
 }
 
-func (s *Service) callCompatEndpoint(path string, q url.Values) (string, error) {
-	addr := strings.TrimSpace(s.conf.GetHTTPAddr())
+func (s *Service) callCompatEndpoint(ctx context.Context, path string, q url.Values) (string, error) {
+	addr := loopbackCompatAddress(s.conf.GetHTTPAddr())
 	if addr == "" {
 		return "", fmt.Errorf("HTTP address is empty")
 	}
@@ -346,20 +365,48 @@ func (s *Service) callCompatEndpoint(path string, q url.Values) (string, error) 
 	if q != nil && len(q) > 0 {
 		u += "?" + q.Encode()
 	}
-	req, err := http.NewRequest(http.MethodGet, u, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return "", err
 	}
-	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
+	resp, err := compatEndpointHTTPClient.Do(req)
 	if err != nil {
 		return "", err
 	}
 	defer resp.Body.Close()
-	b, _ := io.ReadAll(resp.Body)
+	b, err := io.ReadAll(io.LimitReader(resp.Body, maxCompatEndpointResponseBytes+1))
+	if err != nil {
+		return "", err
+	}
+	if len(b) > maxCompatEndpointResponseBytes {
+		return "", fmt.Errorf("compat endpoint response exceeds %d bytes", maxCompatEndpointResponseBytes)
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return "", fmt.Errorf("request failed: %s", strings.TrimSpace(string(b)))
 	}
 	return string(b), nil
+}
+
+func loopbackCompatAddress(address string) string {
+	address = strings.TrimSpace(address)
+	address = strings.TrimPrefix(address, "http://")
+	address = strings.TrimPrefix(address, "https://")
+	if address == "" {
+		return ""
+	}
+	if strings.HasPrefix(address, ":") {
+		return "127.0.0.1" + address
+	}
+	if host, port, err := net.SplitHostPort(address); err == nil {
+		if isWildcardHost(host) {
+			return net.JoinHostPort("127.0.0.1", port)
+		}
+		return address
+	}
+	if isWildcardHost(address) {
+		return "127.0.0.1"
+	}
+	return address
 }
 
 func textResult(text string) *mcp.CallToolResult {
@@ -383,7 +430,7 @@ func setOptionalInt64(q url.Values, key string, v int64) {
 }
 
 func (s *Service) handleMCPWxPing(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	body, err := s.callCompatEndpoint("/api/v1/ping", nil)
+	body, err := s.callCompatEndpoint(ctx, "/api/v1/ping", nil)
 	if err != nil {
 		return errors.ErrMCPTool(err), nil
 	}
@@ -405,7 +452,7 @@ func (s *Service) handleMCPWxContacts(ctx context.Context, request mcp.CallToolR
 	if req.Offset > 0 {
 		q.Set("offset", strconv.Itoa(req.Offset))
 	}
-	body, err := s.callCompatEndpoint("/api/v1/contacts", q)
+	body, err := s.callCompatEndpoint(ctx, "/api/v1/contacts", q)
 	if err != nil {
 		return errors.ErrMCPTool(err), nil
 	}
@@ -427,7 +474,7 @@ func (s *Service) handleMCPWxChatRooms(ctx context.Context, request mcp.CallTool
 	if req.Offset > 0 {
 		q.Set("offset", strconv.Itoa(req.Offset))
 	}
-	body, err := s.callCompatEndpoint("/api/v1/chatrooms", q)
+	body, err := s.callCompatEndpoint(ctx, "/api/v1/chatrooms", q)
 	if err != nil {
 		return errors.ErrMCPTool(err), nil
 	}
@@ -441,7 +488,7 @@ func (s *Service) handleMCPWxSessions(ctx context.Context, request mcp.CallToolR
 	_ = request.BindArguments(&req)
 	q := url.Values{}
 	setOptionalInt(q, "limit", req.Limit)
-	body, err := s.callCompatEndpoint("/api/v1/sessions", q)
+	body, err := s.callCompatEndpoint(ctx, "/api/v1/sessions", q)
 	if err != nil {
 		return errors.ErrMCPTool(err), nil
 	}
@@ -480,7 +527,7 @@ func (s *Service) handleMCPWxHistory(ctx context.Context, request mcp.CallToolRe
 		q.Set("until", req.Until)
 	}
 	setOptionalInt64(q, "msg_type", req.MsgType)
-	body, err := s.callCompatEndpoint("/api/v1/history", q)
+	body, err := s.callCompatEndpoint(ctx, "/api/v1/history", q)
 	if err != nil {
 		return errors.ErrMCPTool(err), nil
 	}
@@ -519,7 +566,43 @@ func (s *Service) handleMCPWxSearch(ctx context.Context, request mcp.CallToolReq
 		q.Set("until", req.Until)
 	}
 	setOptionalInt64(q, "msg_type", req.MsgType)
-	body, err := s.callCompatEndpoint("/api/v1/search", q)
+	body, err := s.callCompatEndpoint(ctx, "/api/v1/search", q)
+	if err != nil {
+		return errors.ErrMCPTool(err), nil
+	}
+	return textResult(body), nil
+}
+
+func (s *Service) handleMCPWxSemanticSearch(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	var req struct {
+		Query  string `json:"query"`
+		Chats  string `json:"chats"`
+		Window string `json:"window"`
+		Limit  int    `json:"limit"`
+		Depth  string `json:"depth"`
+		Rerank *bool  `json:"rerank"`
+	}
+	if err := request.BindArguments(&req); err != nil {
+		return errors.ErrMCPTool(err), nil
+	}
+	if strings.TrimSpace(req.Query) == "" {
+		return errors.ErrMCPTool(fmt.Errorf("query is required")), nil
+	}
+	q := url.Values{"query": []string{req.Query}}
+	if req.Chats != "" {
+		q.Set("chats", req.Chats)
+	}
+	if req.Window != "" {
+		q.Set("window", req.Window)
+	}
+	setOptionalInt(q, "limit", req.Limit)
+	if req.Depth != "" {
+		q.Set("depth", req.Depth)
+	}
+	if req.Rerank != nil {
+		q.Set("rerank", strconv.FormatBool(*req.Rerank))
+	}
+	body, err := s.callCompatEndpoint(ctx, "/api/v1/semantic/search", q)
 	if err != nil {
 		return errors.ErrMCPTool(err), nil
 	}
@@ -537,7 +620,7 @@ func (s *Service) handleMCPWxUnread(ctx context.Context, request mcp.CallToolReq
 	if req.Filter != "" {
 		q.Set("filter", req.Filter)
 	}
-	body, err := s.callCompatEndpoint("/api/v1/unread", q)
+	body, err := s.callCompatEndpoint(ctx, "/api/v1/unread", q)
 	if err != nil {
 		return errors.ErrMCPTool(err), nil
 	}
@@ -555,7 +638,7 @@ func (s *Service) handleMCPWxMembers(ctx context.Context, request mcp.CallToolRe
 		return errors.ErrMCPTool(fmt.Errorf("chat is required")), nil
 	}
 	q := url.Values{"chat": []string{req.Chat}}
-	body, err := s.callCompatEndpoint("/api/v1/members", q)
+	body, err := s.callCompatEndpoint(ctx, "/api/v1/members", q)
 	if err != nil {
 		return errors.ErrMCPTool(err), nil
 	}
@@ -573,7 +656,7 @@ func (s *Service) handleMCPWxNewMessages(ctx context.Context, request mcp.CallTo
 	if req.State != "" {
 		q.Set("state", req.State)
 	}
-	body, err := s.callCompatEndpoint("/api/v1/new_messages", q)
+	body, err := s.callCompatEndpoint(ctx, "/api/v1/new_messages", q)
 	if err != nil {
 		return errors.ErrMCPTool(err), nil
 	}
@@ -603,7 +686,7 @@ func (s *Service) handleMCPWxStats(ctx context.Context, request mcp.CallToolRequ
 	if req.Until != "" {
 		q.Set("until", req.Until)
 	}
-	body, err := s.callCompatEndpoint("/api/v1/stats", q)
+	body, err := s.callCompatEndpoint(ctx, "/api/v1/stats", q)
 	if err != nil {
 		return errors.ErrMCPTool(err), nil
 	}
@@ -623,7 +706,7 @@ func (s *Service) handleMCPWxFavorites(ctx context.Context, request mcp.CallTool
 	if req.Query != "" {
 		q.Set("query", req.Query)
 	}
-	body, err := s.callCompatEndpoint("/api/v1/favorites", q)
+	body, err := s.callCompatEndpoint(ctx, "/api/v1/favorites", q)
 	if err != nil {
 		return errors.ErrMCPTool(err), nil
 	}
@@ -649,7 +732,7 @@ func (s *Service) handleMCPWxSNSNotifications(ctx context.Context, request mcp.C
 	if req.IncludeRead {
 		q.Set("include_read", "true")
 	}
-	body, err := s.callCompatEndpoint("/api/v1/sns_notifications", q)
+	body, err := s.callCompatEndpoint(ctx, "/api/v1/sns_notifications", q)
 	if err != nil {
 		return errors.ErrMCPTool(err), nil
 	}
@@ -675,7 +758,7 @@ func (s *Service) handleMCPWxSNSFeed(ctx context.Context, request mcp.CallToolRe
 	if req.User != "" {
 		q.Set("user", req.User)
 	}
-	body, err := s.callCompatEndpoint("/api/v1/sns_feed", q)
+	body, err := s.callCompatEndpoint(ctx, "/api/v1/sns_feed", q)
 	if err != nil {
 		return errors.ErrMCPTool(err), nil
 	}
@@ -707,7 +790,7 @@ func (s *Service) handleMCPWxSNSSearch(ctx context.Context, request mcp.CallTool
 	if req.User != "" {
 		q.Set("user", req.User)
 	}
-	body, err := s.callCompatEndpoint("/api/v1/sns_search", q)
+	body, err := s.callCompatEndpoint(ctx, "/api/v1/sns_search", q)
 	if err != nil {
 		return errors.ErrMCPTool(err), nil
 	}

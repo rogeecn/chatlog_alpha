@@ -285,6 +285,7 @@ func (m *Message) ParseMediaInfo(data string) error {
 		}
 	}
 
+	m.RefreshProxyFields()
 	return nil
 }
 

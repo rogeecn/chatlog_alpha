@@ -5,6 +5,19 @@
 [![Platforms](https://img.shields.io/badge/platform-macOS%20%7C%20Windows-lightgrey)](#平台兼容性)
 [![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 
+## 贡献致谢（置顶）
+
+感谢以下贡献者提交问题复现、实测数据和实现方案。本轮已基于最新 `main` 逐项复核，并把仍适用于当前架构的部分重新整合：
+
+| 贡献者 | Pull Request | 本轮吸收与反馈 |
+|---|---|---|
+| [@TnzGit](https://github.com/TnzGit) | [#68](https://github.com/teest114514/chatlog_alpha/pull/68) | 修复大批量 Embedding 成功响应被 2MB 截断的问题，并保留大响应回归测试。 |
+| [@ouyadi](https://github.com/ouyadi) | [#64](https://github.com/teest114514/chatlog_alpha/pull/64)、[#65](https://github.com/teest114514/chatlog_alpha/pull/65) | 整合 MCP 五分钟超时与请求取消、消息查询降采样、`wx_semantic_search`、索引会话白名单、消息钩子白名单快路径、CORS/Host 与数据库路径边界检查。 |
+| [@marswjf](https://github.com/marswjf) | [#59](https://github.com/teest114514/chatlog_alpha/pull/59)、[#60](https://github.com/teest114514/chatlog_alpha/pull/60) | 整合 Windows 主进程精确识别与 PID 缓存、Action CLI、媒体代理字段、RecordInfo 嵌套资源、Rec 媒体路径和历史账号回填。 |
+| [@think2011](https://github.com/think2011) | [#54](https://github.com/teest114514/chatlog_alpha/pull/54) | 对旧版 webhook、WAL 自动更新、文件锁和时间范围问题进行了系统验证；本轮适配了 WAL 无提交时的全量回退和临时文件锁处理，旧 webhook/时间范围路径已由 messagehook + 直读 WCDB 架构替换。 |
+| [@jingmian](https://github.com/jingmian) | [#18](https://github.com/teest114514/chatlog_alpha/pull/18) | 补充图片密钥扫描的实测提示：需要触发样本时优先打开朋友圈图片。 |
+| [Dependabot](https://github.com/apps/dependabot) | [#23](https://github.com/teest114514/chatlog_alpha/pull/23) | 依赖更新建议已复核，`golang.org/x/crypto` 更新到 Go 1.24 兼容的 `v0.48.0`，并同步相关 `x/*` 依赖。 |
+
 Chatlog Alpha 是面向微信 4.x 的本地聊天数据读取、查询与分析工具，提供：
 
 - 终端交互界面（TUI）
@@ -127,6 +140,7 @@ chmod +x chatlog-darwin-arm64
 2. **重启并获取数据库密钥**：TUI 会显示明确的 6 步进度。
 3. 等待微信重新启动并完成登录。
 4. **获取图片密钥**：仅在需要查看部分加密媒体时执行。
+   - 如果界面提示需要图片验证样本，请优先在微信朋友圈中打开一张图片；部分微信版本打开聊天图片不会生成可识别样本。
 5. **解密数据**：建立本地工作目录。
 6. **启动 HTTP 服务**：浏览器访问 <http://127.0.0.1:5030/>。
 
@@ -258,6 +272,27 @@ make build
 
 更多 CLI 接口说明见 [`skills/chatlog-http-cli/SKILL.md`](./skills/chatlog-http-cli/SKILL.md)。
 
+### Action CLI（JSON Lines）
+
+面向前端、脚本和调试面板的动作接口会逐行输出 JSON 状态：
+
+```bash
+# 账号与状态
+./bin/chatlog action list-accounts
+./bin/chatlog action status --pid <微信PID>
+
+# 密钥与数据
+./bin/chatlog action restart-and-get-key --pid <微信PID>
+./bin/chatlog action get-image-key --pid <微信PID>
+./bin/chatlog action decompress-data --history <历史账号名>
+
+# 长时间运行服务
+./bin/chatlog action start-http --history <历史账号名>
+./bin/chatlog action start-auto-decompress --history <历史账号名>
+```
+
+其他命令：`action set`、`action switch-account`。每个事件包含 `type`、`action`、`stage`、`message`、`timestamp`，成功结果放在 `data`。
+
 ## HTTP API 与 MCP
 
 HTTP 服务默认监听 `0.0.0.0:5030`，本机访问地址为：
@@ -291,6 +326,8 @@ http://127.0.0.1:5030/
 - `ANY /mcp/`
 - `ANY /sse`
 - `ANY /message`
+
+除会话、历史、搜索等兼容工具外，MCP 还提供 `wx_semantic_search`，可直接调用现有向量索引进行跨会话语义检索。
 
 Hermes Agent 示例：
 
@@ -338,6 +375,14 @@ llama-server -m /path/to/embedding.gguf --embeddings -c 512 --port 8080
 - 时间图谱：`<WorkDir>/.chatlog_graph/temporal_graph.db`
 
 更换 Embedding 模型或维度后，需要重新构建向量索引。
+
+如只需索引指定会话，可在语义配置中设置：
+
+```yaml
+index_chatrooms:
+  - "123456789@chatroom"
+  - "wxid_example"
+```
 
 ## 权限与数据目录
 

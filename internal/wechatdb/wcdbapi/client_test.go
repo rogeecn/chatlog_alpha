@@ -102,6 +102,58 @@ func TestNewClientRecoversMissingEmptyDatabaseMapping(t *testing.T) {
 	}
 }
 
+func TestResolvePathWithinDataDir(t *testing.T) {
+	root := t.TempDir()
+	dataDir := filepath.Join(root, "db_storage")
+	inside := filepath.Join(dataDir, "message", "message_0.db")
+	if err := os.MkdirAll(filepath.Dir(inside), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(inside, []byte("db"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, requested := range []string{
+		inside,
+		"message/message_0.db",
+		"db_storage/message/message_0.db",
+	} {
+		got, err := resolvePathWithinDataDir(dataDir, requested)
+		if err != nil {
+			t.Fatalf("resolvePathWithinDataDir(%q): %v", requested, err)
+		}
+		if filepath.Clean(got) != filepath.Clean(inside) {
+			t.Fatalf("resolvePathWithinDataDir(%q) = %q, want %q", requested, got, inside)
+		}
+	}
+}
+
+func TestResolvePathWithinDataDirRejectsTraversalAndSymlinkEscape(t *testing.T) {
+	root := t.TempDir()
+	dataDir := filepath.Join(root, "db_storage")
+	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(root, "outside.db")
+	if err := os.WriteFile(outside, []byte("db"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, requested := range []string{outside, "../outside.db"} {
+		if got, err := resolvePathWithinDataDir(dataDir, requested); err == nil {
+			t.Fatalf("resolvePathWithinDataDir(%q) accepted %q", requested, got)
+		}
+	}
+
+	link := filepath.Join(dataDir, "linked.db")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Skipf("symlink fixture unavailable: %v", err)
+	}
+	if got, err := resolvePathWithinDataDir(dataDir, link); err == nil {
+		t.Fatalf("symlink escape accepted as %q", got)
+	}
+}
+
 func writeWCDBEncryptedTestPage(t *testing.T, path, keyHex string, salt []byte) {
 	t.Helper()
 	key, err := hex.DecodeString(keyHex)
