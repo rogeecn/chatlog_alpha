@@ -29,36 +29,38 @@ const (
 )
 
 type SemanticConfig struct {
-	Enabled             bool    `mapstructure:"enabled" json:"enabled"`
-	APIKey              string  `mapstructure:"api_key" json:"api_key"`
-	BaseURL             string  `mapstructure:"base_url" json:"base_url"`
-	OllamaBaseURL       string  `mapstructure:"ollama_base_url" json:"ollama_base_url"`
-	DeepSeekAPIKey      string  `mapstructure:"deepseek_api_key" json:"deepseek_api_key"`
-	DeepSeekBaseURL     string  `mapstructure:"deepseek_base_url" json:"deepseek_base_url"`
-	EmbeddingProvider   string  `mapstructure:"embedding_provider" json:"embedding_provider"`
-	RerankProvider      string  `mapstructure:"rerank_provider" json:"rerank_provider"`
-	ChatProvider        string  `mapstructure:"chat_provider" json:"chat_provider"`
-	EmbeddingModel      string  `mapstructure:"embedding_model" json:"embedding_model"`
-	RerankModel         string  `mapstructure:"rerank_model" json:"rerank_model"`
-	ChatModel           string  `mapstructure:"chat_model" json:"chat_model"`
-	ChatThinking        bool    `mapstructure:"chat_thinking" json:"chat_thinking"`
-	ChatMaxTokens       int     `mapstructure:"chat_max_tokens" json:"chat_max_tokens"`
-	ChatTemperature     float64 `mapstructure:"chat_temperature" json:"chat_temperature"`
-	EmbeddingDimension  int     `mapstructure:"embedding_dimension" json:"embedding_dimension"`
-	EnableRerank        bool    `mapstructure:"enable_rerank" json:"enable_rerank"`
-	EnableQA            bool    `mapstructure:"enable_qa" json:"enable_qa"`
-	EnableTopics        bool    `mapstructure:"enable_topics" json:"enable_topics"`
-	EnableProfiles      bool    `mapstructure:"enable_profiles" json:"enable_profiles"`
-	EnableLLMChunk      bool    `mapstructure:"enable_llm_chunk" json:"enable_llm_chunk"`
-	RealtimeIndex       bool    `mapstructure:"realtime_index" json:"realtime_index"`
-	IndexWorkers        int     `mapstructure:"index_workers" json:"index_workers"`
-	RecallK             int     `mapstructure:"recall_k" json:"recall_k"`
-	TopN                int     `mapstructure:"top_n" json:"top_n"`
-	SimilarityThreshold float64 `mapstructure:"similarity_threshold" json:"similarity_threshold"`
+	Enabled             bool     `mapstructure:"enabled" json:"enabled"`
+	APIKey              string   `mapstructure:"api_key" json:"api_key"`
+	BaseURL             string   `mapstructure:"base_url" json:"base_url"`
+	OllamaBaseURL       string   `mapstructure:"ollama_base_url" json:"ollama_base_url"`
+	DeepSeekAPIKey      string   `mapstructure:"deepseek_api_key" json:"deepseek_api_key"`
+	DeepSeekBaseURL     string   `mapstructure:"deepseek_base_url" json:"deepseek_base_url"`
+	EmbeddingProvider   string   `mapstructure:"embedding_provider" json:"embedding_provider"`
+	RerankProvider      string   `mapstructure:"rerank_provider" json:"rerank_provider"`
+	ChatProvider        string   `mapstructure:"chat_provider" json:"chat_provider"`
+	EmbeddingModel      string   `mapstructure:"embedding_model" json:"embedding_model"`
+	RerankModel         string   `mapstructure:"rerank_model" json:"rerank_model"`
+	ChatModel           string   `mapstructure:"chat_model" json:"chat_model"`
+	ChatThinking        bool     `mapstructure:"chat_thinking" json:"chat_thinking"`
+	ChatMaxTokens       int      `mapstructure:"chat_max_tokens" json:"chat_max_tokens"`
+	ChatTemperature     float64  `mapstructure:"chat_temperature" json:"chat_temperature"`
+	EmbeddingDimension  int      `mapstructure:"embedding_dimension" json:"embedding_dimension"`
+	EnableRerank        bool     `mapstructure:"enable_rerank" json:"enable_rerank"`
+	EnableQA            bool     `mapstructure:"enable_qa" json:"enable_qa"`
+	EnableTopics        bool     `mapstructure:"enable_topics" json:"enable_topics"`
+	EnableProfiles      bool     `mapstructure:"enable_profiles" json:"enable_profiles"`
+	EnableLLMChunk      bool     `mapstructure:"enable_llm_chunk" json:"enable_llm_chunk"`
+	RealtimeIndex       bool     `mapstructure:"realtime_index" json:"realtime_index"`
+	IndexWorkers        int      `mapstructure:"index_workers" json:"index_workers"`
+	IndexChatrooms      []string `mapstructure:"index_chatrooms" json:"index_chatrooms"`
+	RecallK             int      `mapstructure:"recall_k" json:"recall_k"`
+	TopN                int      `mapstructure:"top_n" json:"top_n"`
+	SimilarityThreshold float64  `mapstructure:"similarity_threshold" json:"similarity_threshold"`
 }
 
 func NormalizeSemanticConfig(in SemanticConfig) SemanticConfig {
 	out := in
+	out.IndexChatrooms = normalizeSemanticTalkers(out.IndexChatrooms)
 	out.BaseURL = strings.TrimSpace(out.BaseURL)
 	if out.BaseURL == "" {
 		out.BaseURL = DefaultGLMBaseURL
@@ -143,6 +145,39 @@ func NormalizeSemanticConfig(in SemanticConfig) SemanticConfig {
 	}
 	if out.SimilarityThreshold <= 0 || out.SimilarityThreshold > 1 {
 		out.SimilarityThreshold = DefaultSemanticThreshold
+	}
+	return out
+}
+
+func SemanticTalkerAllowed(cfg SemanticConfig, talker string) bool {
+	if len(cfg.IndexChatrooms) == 0 {
+		return true
+	}
+	talker = strings.TrimSpace(talker)
+	for _, allowed := range cfg.IndexChatrooms {
+		if strings.TrimSpace(allowed) == talker {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeSemanticTalkers(in []string) []string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(in))
+	seen := make(map[string]struct{}, len(in))
+	for _, item := range in {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		if _, ok := seen[item]; ok {
+			continue
+		}
+		seen[item] = struct{}{}
+		out = append(out, item)
 	}
 	return out
 }

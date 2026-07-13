@@ -327,6 +327,16 @@ func (c *Context) SetImgKey(key string) {
 	c.UpdateConfig()
 }
 
+func (c *Context) SetDataKey(key string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.DataKey == key {
+		return
+	}
+	c.DataKey = key
+	c.UpdateConfig()
+}
+
 func (c *Context) SetAutoDecrypt(enabled bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

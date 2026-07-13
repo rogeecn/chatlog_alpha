@@ -162,15 +162,16 @@ type RecordItem struct {
 
 // RecordInfo 表示聊天记录信息
 type RecordInfo struct {
-	XMLName       xml.Name `xml:"recordinfo"`
-	FromScene     string   `xml:"fromscene,omitempty"`
-	FavUsername   string   `xml:"favusername,omitempty"`
-	FavCreateTime string   `xml:"favcreatetime,omitempty"`
-	IsChatRoom    string   `xml:"isChatRoom,omitempty"`
-	Title         string   `xml:"title,omitempty"`
-	Desc          string   `xml:"desc,omitempty"`
-	Info          string   `xml:"info,omitempty"`
-	DataList      DataList `xml:"datalist,omitempty"`
+	XMLName       xml.Name      `xml:"recordinfo"`
+	FromScene     string        `xml:"fromscene,omitempty"`
+	FavUsername   string        `xml:"favusername,omitempty"`
+	FavCreateTime string        `xml:"favcreatetime,omitempty"`
+	IsChatRoom    string        `xml:"isChatRoom,omitempty"`
+	Title         string        `xml:"title,omitempty"`
+	Desc          string        `xml:"desc,omitempty"`
+	Info          string        `xml:"info,omitempty"`
+	DataList      DataList      `xml:"datalist,omitempty"`
+	Assets        []RecordAsset `json:"assets,omitempty" xml:"-"`
 }
 
 // DataList 表示数据列表
@@ -221,6 +222,13 @@ type DataItem struct {
 	// 套娃合并转发
 	DataTitle string     `xml:"datatitle,omitempty"`
 	RecordXML *RecordXML `xml:"recordxml,omitempty"`
+
+	MD5       string `json:"md5,omitempty" xml:"-"`
+	ProxyType string `json:"proxyType,omitempty" xml:"-"`
+	ProxyKey  string `json:"proxyKey,omitempty" xml:"-"`
+	ProxyURL  string `json:"proxyUrl,omitempty" xml:"-"`
+	Resolved  bool   `json:"resolved" xml:"-"`
+	KeySource string `json:"keySource,omitempty" xml:"-"`
 }
 
 type DataItemLocation struct {

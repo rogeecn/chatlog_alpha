@@ -102,6 +102,7 @@ func (m *MessageV4) Wrap(talker string) *Message {
 		}
 	}
 
+	_m.RefreshProxyFields()
 	return _m
 }
 

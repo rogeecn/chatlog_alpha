@@ -105,7 +105,7 @@ func NewService(conf Config, db *database.Service) *Service {
 		errors.RecoveryMiddleware(),
 		errors.ErrorHandlerMiddleware(),
 		gin.LoggerWithWriter(log.Logger, "/health"),
-		corsMiddleware(),
+		corsMiddleware(conf.GetHTTPAddr()),
 	)
 
 	s := &Service{
@@ -200,6 +200,10 @@ func (s *Service) startSemanticIncrementalWatcher() {
 	if s.semantic == nil || s.db == nil {
 		return
 	}
+	cfg := s.conf.GetSemanticConfig()
+	if cfg == nil || !cfg.Enabled || !cfg.RealtimeIndex {
+		return
+	}
 	s.semanticWatchMu.Lock()
 	defer s.semanticWatchMu.Unlock()
 	if s.semanticWatchCancel != nil {
@@ -239,6 +243,9 @@ func (s *Service) runSemanticIncrementalWatcher(ctx context.Context) {
 		latest := 0
 		for _, item := range sessions.Items {
 			if item == nil {
+				continue
+			}
+			if !conf.SemanticTalkerAllowed(*cfg, item.UserName) {
 				continue
 			}
 			if item.NOrder > latest {
