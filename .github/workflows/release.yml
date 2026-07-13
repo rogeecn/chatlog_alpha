@@ -118,8 +118,31 @@ jobs:
           short_sha="${GITHUB_SHA::7}"
           for arch in amd64 arm64; do
             chmod 755 "dist/chatlog-darwin-${arch}"
+            package_dir="dist/package-${arch}"
+            packaged_binary="${package_dir}/chatlog-darwin-${arch}"
+            launcher="${package_dir}/start-chatlog.command"
+            mkdir -p "${package_dir}"
+            cp "dist/chatlog-darwin-${arch}" "${packaged_binary}"
+            cat > "${launcher}" <<EOF
+          #!/bin/zsh
+          set -euo pipefail
+
+          script_dir="\$(cd -- "\$(dirname -- "\$0")" && pwd)"
+          binary="\${script_dir}/chatlog-darwin-${arch}"
+
+          chmod 755 "\${binary}"
+          xattr -d com.apple.quarantine "\${binary}" 2>/dev/null || true
+          exec "\${binary}" "\$@"
+          EOF
+            chmod 755 "${launcher}"
+            /bin/zsh -n "${launcher}"
+            "${launcher}" --help >/dev/null
             archive="release/chatlog_${short_sha}_darwin_${arch}.zip"
-            /usr/bin/zip -j "${archive}" "dist/chatlog-darwin-${arch}" LICENSE README.md
+            /usr/bin/zip -j "${archive}" \
+              "${packaged_binary}" \
+              "${launcher}" \
+              LICENSE \
+              README.md
           done
 
       - name: Upload Artifact
