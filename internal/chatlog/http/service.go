@@ -55,8 +55,9 @@ type Service struct {
 	statsCacheMu sync.RWMutex
 	statsCache   map[string]statsCacheEntry
 
-	semantic *semantic.Manager
-	graph    *temporalgraph.Manager
+	semantic  *semantic.Manager
+	graph     *temporalgraph.Manager
+	sendDebug *sendDebugManager
 
 	semanticWatchMu      sync.Mutex
 	semanticWatchCancel  context.CancelFunc
@@ -117,6 +118,7 @@ func NewService(conf Config, db *database.Service) *Service {
 		hookEvents:       make([]messagehook.Event, 0, 200),
 		hookSubscribers:  map[chan messagehook.Event]struct{}{},
 		statsCache:       map[string]statsCacheEntry{},
+		sendDebug:        newSendDebugManager(),
 	}
 	sem, err := semantic.NewManager(conf, db)
 	if err != nil {
@@ -171,7 +173,9 @@ func (s *Service) ListenAndServe() error {
 }
 
 func (s *Service) Stop() error {
-
+	if s.sendDebug != nil {
+		s.sendDebug.close()
+	}
 	if s.server == nil {
 		return nil
 	}
