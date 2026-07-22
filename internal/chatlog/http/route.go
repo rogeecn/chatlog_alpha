@@ -76,6 +76,14 @@ func (s *Service) initBaseRouter() {
 	s.router.GET("/api/v1/hook/hermes/qq", s.handleHookHermesQQGet)
 	s.router.POST("/api/v1/hook/hermes/qq", s.handleHookHermesQQSet)
 	s.router.GET("/api/v1/hook/stream", s.handleHookStream)
+	s.router.GET("/api/v1/send-debug/environment", s.handleSendDebugEnvironment)
+	s.router.POST("/api/v1/send-debug/jobs", s.handleSendDebugJobCreate)
+	s.router.GET("/api/v1/send-debug/jobs/active", s.handleSendDebugActiveJobGet)
+	s.router.GET("/api/v1/send-debug/jobs/:id", s.handleSendDebugJobGet)
+	s.router.POST("/api/v1/send-debug/jobs/:id/send", s.handleSendDebugJobEnqueue)
+	s.router.GET("/api/v1/send-debug/jobs/:id/commands/:command_id", s.handleSendDebugCommandGet)
+	s.router.POST("/api/v1/send-debug/jobs/:id/release", s.handleSendDebugJobRelease)
+	s.router.POST("/api/v1/send-debug/jobs/:id/cancel", s.handleSendDebugJobCancel)
 	s.router.GET("/api/v1/semantic/config", s.handleSemanticConfigGet)
 	s.router.POST("/api/v1/semantic/config", s.handleSemanticConfigSet)
 	s.router.POST("/api/v1/semantic/test", s.handleSemanticTest)
@@ -123,6 +131,7 @@ func (s *Service) initAPIRouter() {
 		api.GET("/sns_search", s.handleSNSSearchCompat)
 		api.GET("/sns/media/proxy", s.handleSNSMediaProxy)
 		api.GET("/contacts", s.handleContactsCompat)
+		api.GET("/openim/:wxid/corp", s.handleOpenimCorp)
 		api.GET("/chatrooms", s.handleChatRoomsCompat)
 		api.GET("/db", s.handleGetDBs)
 		api.GET("/db/search", s.handleSearchAllDBs)
@@ -238,32 +247,33 @@ func (s *Service) handleHookConfigSet(c *gin.Context) {
 }
 
 type semanticConfigReq struct {
-	Enabled             bool    `json:"enabled"`
-	APIKey              string  `json:"api_key"`
-	BaseURL             string  `json:"base_url"`
-	OllamaBaseURL       string  `json:"ollama_base_url"`
-	DeepSeekAPIKey      string  `json:"deepseek_api_key"`
-	DeepSeekBaseURL     string  `json:"deepseek_base_url"`
-	EmbeddingProvider   string  `json:"embedding_provider"`
-	RerankProvider      string  `json:"rerank_provider"`
-	ChatProvider        string  `json:"chat_provider"`
-	EmbeddingModel      string  `json:"embedding_model"`
-	RerankModel         string  `json:"rerank_model"`
-	ChatModel           string  `json:"chat_model"`
-	ChatThinking        bool    `json:"chat_thinking"`
-	ChatMaxTokens       int     `json:"chat_max_tokens"`
-	ChatTemperature     float64 `json:"chat_temperature"`
-	EmbeddingDimension  int     `json:"embedding_dimension"`
-	EnableRerank        bool    `json:"enable_rerank"`
-	EnableQA            bool    `json:"enable_qa"`
-	EnableTopics        bool    `json:"enable_topics"`
-	EnableProfiles      bool    `json:"enable_profiles"`
-	EnableLLMChunk      bool    `json:"enable_llm_chunk"`
-	RealtimeIndex       bool    `json:"realtime_index"`
-	IndexWorkers        int     `json:"index_workers"`
-	RecallK             int     `json:"recall_k"`
-	TopN                int     `json:"top_n"`
-	SimilarityThreshold float64 `json:"similarity_threshold"`
+	Enabled             bool     `json:"enabled"`
+	APIKey              string   `json:"api_key"`
+	BaseURL             string   `json:"base_url"`
+	OllamaBaseURL       string   `json:"ollama_base_url"`
+	DeepSeekAPIKey      string   `json:"deepseek_api_key"`
+	DeepSeekBaseURL     string   `json:"deepseek_base_url"`
+	EmbeddingProvider   string   `json:"embedding_provider"`
+	RerankProvider      string   `json:"rerank_provider"`
+	ChatProvider        string   `json:"chat_provider"`
+	EmbeddingModel      string   `json:"embedding_model"`
+	RerankModel         string   `json:"rerank_model"`
+	ChatModel           string   `json:"chat_model"`
+	ChatThinking        bool     `json:"chat_thinking"`
+	ChatMaxTokens       int      `json:"chat_max_tokens"`
+	ChatTemperature     float64  `json:"chat_temperature"`
+	EmbeddingDimension  int      `json:"embedding_dimension"`
+	EnableRerank        bool     `json:"enable_rerank"`
+	EnableQA            bool     `json:"enable_qa"`
+	EnableTopics        bool     `json:"enable_topics"`
+	EnableProfiles      bool     `json:"enable_profiles"`
+	EnableLLMChunk      bool     `json:"enable_llm_chunk"`
+	RealtimeIndex       bool     `json:"realtime_index"`
+	IndexWorkers        int      `json:"index_workers"`
+	IndexChatrooms      []string `json:"index_chatrooms"`
+	RecallK             int      `json:"recall_k"`
+	TopN                int      `json:"top_n"`
+	SimilarityThreshold float64  `json:"similarity_threshold"`
 }
 
 func (s *Service) handleSemanticConfigGet(c *gin.Context) {
@@ -298,6 +308,7 @@ func (s *Service) handleSemanticConfigGet(c *gin.Context) {
 		"enable_llm_chunk":     norm.EnableLLMChunk,
 		"realtime_index":       norm.RealtimeIndex,
 		"index_workers":        norm.IndexWorkers,
+		"index_chatrooms":      norm.IndexChatrooms,
 		"recall_k":             norm.RecallK,
 		"top_n":                norm.TopN,
 		"similarity_threshold": norm.SimilarityThreshold,
@@ -309,6 +320,12 @@ func (s *Service) handleSemanticConfigSet(c *gin.Context) {
 	if err := c.ShouldBindJSON(&req); err != nil {
 		errors.Err(c, errors.InvalidArg("body"))
 		return
+	}
+	indexChatrooms := req.IndexChatrooms
+	if indexChatrooms == nil {
+		if old := s.conf.GetSemanticConfig(); old != nil {
+			indexChatrooms = append([]string(nil), old.IndexChatrooms...)
+		}
 	}
 	cfg := conf.NormalizeSemanticConfig(conf.SemanticConfig{
 		Enabled:             true,
@@ -334,6 +351,7 @@ func (s *Service) handleSemanticConfigSet(c *gin.Context) {
 		EnableLLMChunk:      req.EnableLLMChunk,
 		RealtimeIndex:       true,
 		IndexWorkers:        req.IndexWorkers,
+		IndexChatrooms:      indexChatrooms,
 		RecallK:             req.RecallK,
 		TopN:                req.TopN,
 		SimilarityThreshold: req.SimilarityThreshold,
@@ -353,6 +371,8 @@ func (s *Service) handleSemanticConfigSet(c *gin.Context) {
 		return
 	}
 	s.conf.SetSemanticConfig(cfg)
+	s.stopSemanticIncrementalWatcher()
+	s.startSemanticIncrementalWatcher()
 	s.handleSemanticConfigGet(c)
 }
 
@@ -3143,6 +3163,34 @@ func normalizeOutputFormat(raw string) (string, error) {
 	return "", errors.InvalidArg("format")
 }
 
+// handleOpenimCorp 给定 @openim 用户的 wxid，返回其企业名 + 企业 ID。
+// GET /api/v1/openim/{wxid}/corp
+// wxid 不存在 / 不是 openim / 没有企业信息一律返回 200 + 空字段，不报错。
+func (s *Service) handleOpenimCorp(c *gin.Context) {
+	wxid := strings.TrimSpace(c.Param("wxid"))
+	if wxid == "" {
+		errors.Err(c, errors.InvalidArg("wxid"))
+		return
+	}
+	resp := gin.H{
+		"wxid":      wxid,
+		"corp_id":   "",
+		"corp_name": "",
+	}
+	if !strings.HasSuffix(wxid, "@openim") {
+		writeByFormat(c, resp, c.Query("format"))
+		return
+	}
+	contact, err := s.db.GetContact(wxid)
+	if err != nil || contact == nil {
+		writeByFormat(c, resp, c.Query("format"))
+		return
+	}
+	resp["corp_id"] = contact.CorpID
+	resp["corp_name"] = contact.CorpName
+	writeByFormat(c, resp, c.Query("format"))
+}
+
 func writeByFormat(c *gin.Context, payload interface{}, rawFormat string) {
 	format, err := normalizeOutputFormat(rawFormat)
 	if err != nil {
@@ -3648,6 +3696,7 @@ func (s *Service) handleChatlog(c *gin.Context) {
 
 	// Populate md5->path cache for media files
 	s.populateMD5PathCache(messages)
+	s.enrichMessages(messages)
 
 	switch strings.ToLower(q.Format) {
 	case "csv":
@@ -3865,6 +3914,7 @@ func (s *Service) handleHistory(c *gin.Context) {
 	rows := make([]gin.H, 0, len(messages))
 	// Keep media key/path cache warm for direct /image/{md5} access.
 	s.populateMD5PathCache(messages)
+	s.enrichMessages(messages)
 	for _, m := range messages {
 		rows = append(rows, toHistoryMessage(m, c.Request.Host))
 	}

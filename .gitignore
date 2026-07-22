@@ -51,6 +51,8 @@ release/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
+__pycache__/
+*.py[cod]
 .parcel-cache/
 .turbo/
 .vite/
@@ -90,5 +92,6 @@ semantic_index.db-*
 tmpclaude-*/
 
 # Test files
+test/
 sns.md
 .claude/settings.local.json

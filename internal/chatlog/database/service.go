@@ -42,6 +42,8 @@ type Config interface {
 	GetMessageHook() *conf.MessageHook
 	GetSemanticConfig() *conf.SemanticConfig
 	GetWalEnabled() bool
+	// GetAccount 当前激活账号（含 local hex suffix）；server 模式返回空串。
+	GetAccount() string
 }
 
 func NewService(conf Config) *Service {
@@ -137,6 +139,10 @@ func (s *Service) GetSessions(key string, limit, offset int) (*wechatdb.GetSessi
 
 func (s *Service) GetMedia(_type string, key string) (*model.Media, error) {
 	return s.db.GetMedia(_type, key)
+}
+
+func (s *Service) GetMediaByName(_type string, name string, size int64) (*model.Media, error) {
+	return s.db.GetMediaByName(_type, name, size)
 }
 
 func (s *Service) GetDecryptedDBs() (map[string][]string, error) {

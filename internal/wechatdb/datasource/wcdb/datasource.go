@@ -131,13 +131,7 @@ func (ds *DataSource) GetMessages(ctx context.Context, startTime, endTime time.T
 
 	perTalkerLimit := 0
 	if limit > 0 {
-		perTalkerLimit = (limit + offset) * 5
-		if perTalkerLimit < 1000 {
-			perTalkerLimit = 1000
-		}
-		if perTalkerLimit > 50000 {
-			perTalkerLimit = 50000
-		}
+		perTalkerLimit = messageQueryFetchLimit(limit, offset, sender != "" || keyword != "")
 	}
 
 	out := make([]*model.Message, 0, perTalkerLimit*len(talkers))
@@ -156,15 +150,17 @@ func (ds *DataSource) GetMessages(ctx context.Context, startTime, endTime time.T
 
 		for _, row := range rows {
 			msgV4 := model.MessageV4{
-				LocalID:        toInt64(row["local_id"]),
-				SortSeq:        toInt64(row["sort_seq"]),
-				ServerID:       toInt64(row["server_id"]),
-				LocalType:      toInt64(row["local_type"]),
-				UserName:       toString(row["user_name"]),
-				CreateTime:     toInt64(row["create_time"]),
-				MessageContent: toBytes(row["message_content"]),
-				PackedInfoData: toBytes(row["packed_info_data"]),
-				Status:         int(toInt64(row["status"])),
+				LocalID:         toInt64(row["local_id"]),
+				SortSeq:         toInt64(row["sort_seq"]),
+				ServerID:        toInt64(row["server_id"]),
+				LocalType:       toInt64(row["local_type"]),
+				UserName:        toString(row["user_name"]),
+				CreateTime:      toInt64(row["create_time"]),
+				MessageContent:  toBytes(row["message_content"]),
+				CompressContent: toBytes(row["compress_content"]),
+				Source:          toBytes(row["source"]),
+				PackedInfoData:  toBytes(row["packed_info_data"]),
+				Status:          toInt64(row["status"]),
 			}
 			msg := msgV4.Wrap(tk)
 			if msg == nil {
@@ -219,6 +215,31 @@ func (ds *DataSource) GetMessages(ctx context.Context, startTime, endTime time.T
 	return out, nil
 }
 
+func messageQueryFetchLimit(limit, offset int, hasPostFilter bool) int {
+	if limit <= 0 {
+		return 0
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	const maxRequestedBeforeMultiplier = 50000 / 5
+	if offset >= maxRequestedBeforeMultiplier || limit >= maxRequestedBeforeMultiplier-offset {
+		return 50000
+	}
+	fetchLimit := (limit + offset) * 5
+	minimum := 20
+	if hasPostFilter {
+		minimum = 1000
+	}
+	if fetchLimit < minimum {
+		fetchLimit = minimum
+	}
+	if fetchLimit > 50000 {
+		fetchLimit = 50000
+	}
+	return fetchLimit
+}
+
 func (ds *DataSource) GetMessage(ctx context.Context, talker string, seq int64) (*model.Message, error) {
 	msgs, err := ds.GetMessages(ctx, time.Unix(0, 0), time.Now().Add(time.Hour), talker, "", "", 2000, 0)
 	if err != nil {
@@ -234,18 +255,22 @@ func (ds *DataSource) GetMessage(ctx context.Context, talker string, seq int64) 
 
 func (ds *DataSource) GetContacts(ctx context.Context, key string, limit, offset int) ([]*model.Contact, error) {
 	_ = ctx
-	rows, err := ds.client.Query("contact", "", `SELECT username, local_type, alias, remark, nick_name FROM contact ORDER BY username`)
+	// extra_buffer 必须读出来：ContactV4.Wrap 用它解析 @openim 用户的 corp_id。
+	// 缺这一列，所有企业微信联系人 corp_id 都是空，下游也就拿不到企业名。
+	rows, err := ds.client.Query("contact", "", `SELECT username, local_type, alias, remark, nick_name, COALESCE(description, '') AS description, extra_buffer FROM contact ORDER BY username`)
 	if err != nil {
 		return nil, err
 	}
 	items := make([]*model.Contact, 0, len(rows))
 	for _, row := range rows {
 		c := (&model.ContactV4{
-			UserName:  toString(row["username"]),
-			LocalType: int(toInt64(row["local_type"])),
-			Alias:     toString(row["alias"]),
-			Remark:    toString(row["remark"]),
-			NickName:  toString(row["nick_name"]),
+			UserName:    toString(row["username"]),
+			LocalType:   int(toInt64(row["local_type"])),
+			Alias:       toString(row["alias"]),
+			Remark:      toString(row["remark"]),
+			NickName:    toString(row["nick_name"]),
+			Description: toString(row["description"]),
+			ExtraBuffer: toBytes(row["extra_buffer"]),
 		}).Wrap()
 		if key != "" && !(c.UserName == key || c.Alias == key || c.Remark == key || c.NickName == key) {
 			continue
@@ -264,6 +289,28 @@ func (ds *DataSource) GetContacts(ctx context.Context, key string, limit, offset
 	return items, nil
 }
 
+// GetOpenimWordings 读取 contact.db 的 openim_wording 表，返回 corp_id → 企业名映射。
+func (ds *DataSource) GetOpenimWordings(ctx context.Context) ([]*model.OpenimWording, error) {
+	_ = ctx
+	rows, err := ds.client.Query("contact", "",
+		`SELECT lang_id, app_id, wording_id, wording, COALESCE(pinyin,'') AS pinyin, COALESCE(quan_pin,'') AS quan_pin FROM openim_wording`)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]*model.OpenimWording, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, &model.OpenimWording{
+			LangID:    int(toInt64(row["lang_id"])),
+			AppID:     toString(row["app_id"]),
+			WordingID: toString(row["wording_id"]),
+			Wording:   toString(row["wording"]),
+			Pinyin:    toString(row["pinyin"]),
+			QuanPin:   toString(row["quan_pin"]),
+		})
+	}
+	return out, nil
+}
+
 func (ds *DataSource) GetChatRooms(ctx context.Context, key string, limit, offset int) ([]*model.ChatRoom, error) {
 	_ = ctx
 	rows, err := ds.client.Query("contact", "", `SELECT username, owner, ext_buffer FROM chat_room ORDER BY username`)
@@ -271,6 +318,7 @@ func (ds *DataSource) GetChatRooms(ctx context.Context, key string, limit, offse
 		return nil, err
 	}
 	items := make([]*model.ChatRoom, 0, len(rows))
+	seen := make(map[string]bool)
 	for _, row := range rows {
 		chat := (&model.ChatRoomV4{
 			UserName:  toString(row["username"]),
@@ -280,7 +328,33 @@ func (ds *DataSource) GetChatRooms(ctx context.Context, key string, limit, offse
 		if key != "" && chat.Name != key {
 			continue
 		}
+		seen[chat.Name] = true
 		items = append(items, chat)
+	}
+	// contact 表的 chat_room 有时缺失只在消息里出现过的群（例如从未打开过详情的群）。
+	// 用各 message DB 的 Name2Id 表补齐这些 @chatroom，避免群列表漏项。
+	if msgDBs, err2 := ds.client.ListMessageDBs(); err2 == nil {
+		for _, dbPath := range msgDBs {
+			n2iRows, err3 := ds.client.Query("message", dbPath, `SELECT user_name FROM Name2Id WHERE user_name LIKE '%@chatroom'`)
+			if err3 != nil {
+				continue
+			}
+			for _, r := range n2iRows {
+				name := toString(r["user_name"])
+				if name == "" || seen[name] {
+					continue
+				}
+				if key != "" && name != key {
+					continue
+				}
+				seen[name] = true
+				items = append(items, &model.ChatRoom{
+					Name:             name,
+					Users:            make([]model.ChatRoomUser, 0),
+					User2DisplayName: make(map[string]string),
+				})
+			}
+		}
 	}
 	if offset > len(items) {
 		return []*model.ChatRoom{}, nil
@@ -346,20 +420,14 @@ func (ds *DataSource) GetMedia(ctx context.Context, _type, key string) (*model.M
 		return &model.Media{Type: "voice", Key: key, Data: data}, nil
 	}
 
-	table := "image_hardlink_info_v4"
-	switch _type {
-	case "image":
-		table = "image_hardlink_info_v4"
-	case "video":
-		table = "video_hardlink_info_v4"
-	case "file":
-		table = "file_hardlink_info_v4"
-	default:
-		return nil, errors.MediaTypeUnsupported(_type)
+	table, err := hardlinkTableForMediaType(_type)
+	if err != nil {
+		return nil, err
 	}
 	sql := fmt.Sprintf(`
 SELECT
 	f.md5,
+	f.type AS hardlink_type,
 	f.file_name,
 	f.file_size,
 	f.modify_time,
@@ -375,8 +443,63 @@ WHERE f.md5 = %s OR f.file_name LIKE %s || '%%'
 	if err != nil || len(rows) == 0 {
 		return nil, errors.ErrMediaNotFound
 	}
+	return mediaFromHardlinkRows(_type, rows)
+}
+
+func (ds *DataSource) GetMediaByName(ctx context.Context, mediaType, name string, size int64) (*model.Media, error) {
+	_ = ctx
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return nil, errors.ErrKeyEmpty
+	}
+	table, err := hardlinkTableForMediaType(mediaType)
+	if err != nil {
+		return nil, err
+	}
+	sql := fmt.Sprintf(`
+SELECT
+	f.md5,
+	f.type AS hardlink_type,
+	f.file_name,
+	f.file_size,
+	f.modify_time,
+	f.extra_buffer,
+	IFNULL(d1.username,"") AS dir1,
+	IFNULL(d2.username,"") AS dir2
+FROM %s f
+LEFT JOIN dir2id d1 ON d1.rowid = f.dir1
+LEFT JOIN dir2id d2 ON d2.rowid = f.dir2
+WHERE f.file_name = %s
+`, table, strconv.Quote(name))
+	if size > 0 {
+		sql += fmt.Sprintf(" AND f.file_size = %d", size)
+	}
+	rows, err := ds.client.Query("media", "", sql)
+	if err != nil || len(rows) == 0 {
+		return nil, errors.ErrMediaNotFound
+	}
+	return mediaFromHardlinkRows(mediaType, rows)
+}
+
+func hardlinkTableForMediaType(mediaType string) (string, error) {
+	switch mediaType {
+	case "image":
+		return "image_hardlink_info_v4", nil
+	case "video":
+		return "video_hardlink_info_v4", nil
+	case "file":
+		return "file_hardlink_info_v4", nil
+	default:
+		return "", errors.MediaTypeUnsupported(mediaType)
+	}
+}
+
+func mediaFromHardlinkRows(mediaType string, rows []map[string]interface{}) (*model.Media, error) {
+	if len(rows) == 0 {
+		return nil, errors.ErrMediaNotFound
+	}
 	best := rows[0]
-	switch _type {
+	switch mediaType {
 	case "image":
 		best = bestImageRow(rows)
 	case "video":
@@ -385,14 +508,15 @@ WHERE f.md5 = %s OR f.file_name LIKE %s || '%%'
 		best = bestFileRow(rows)
 	}
 	mv4 := model.MediaV4{
-		Type:        _type,
-		Key:         toString(best["md5"]),
-		Name:        toString(best["file_name"]),
-		Size:        toInt64(best["file_size"]),
-		ModifyTime:  toInt64(best["modify_time"]),
-		ExtraBuffer: toString(best["extra_buffer"]),
-		Dir1:        toString(best["dir1"]),
-		Dir2:        toString(best["dir2"]),
+		Type:         mediaType,
+		Key:          toString(best["md5"]),
+		Name:         toString(best["file_name"]),
+		Size:         toInt64(best["file_size"]),
+		ModifyTime:   toInt64(best["modify_time"]),
+		ExtraBuffer:  toString(best["extra_buffer"]),
+		Dir1:         toString(best["dir1"]),
+		Dir2:         toString(best["dir2"]),
+		HardLinkType: toInt64(best["hardlink_type"]),
 	}
 	return mv4.Wrap(), nil
 }

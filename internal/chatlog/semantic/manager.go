@@ -1030,6 +1030,9 @@ func (m *Manager) buildAll(ctx context.Context, cfg conf.SemanticConfig, mode st
 		if talker == "" {
 			continue
 		}
+		if !conf.SemanticTalkerAllowed(cfg, talker) {
+			continue
+		}
 		if _, ok := seen[talker]; ok {
 			continue
 		}

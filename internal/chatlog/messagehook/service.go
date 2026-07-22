@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -23,6 +24,17 @@ import (
 	"github.com/sjzar/chatlog/internal/wechatdb"
 )
 
+// chatlog 的 data_dir 命名规则：wxid_<id>_<hex-local-suffix>；strip 后即真正的
+// 微信 wxid（例：wxid_example_1a2b → wxid_example）。
+var chatlogLocalSuffixRe = regexp.MustCompile(`_[0-9a-f]{1,8}$`)
+
+func stripChatlogLocalSuffix(account string) string {
+	if account == "" {
+		return ""
+	}
+	return chatlogLocalSuffixRe.ReplaceAllString(account, "")
+}
+
 const (
 	defaultPollInterval  = 2 * time.Second
 	maxTalkerScan        = 300
@@ -30,6 +42,8 @@ const (
 	maxContextScan       = 2000
 	voiceResolveRetries  = 20
 	voiceResolveInterval = 500 * time.Millisecond
+	maxPendingPosts      = 1000
+	maxPostRetryDelay    = time.Minute
 )
 
 type Config interface {
@@ -37,6 +51,10 @@ type Config interface {
 	GetDataDir() string
 	GetHTTPAddr() string
 	GetSemanticConfig() *conf.SemanticConfig
+	// GetAccount 返回当前 chatlog 监听的 raw account ID（含 local hex suffix，如
+	// wxid_example_1a2b）。messagehook strip 后填到 Event.OwnerWxid，让 webhook
+	// 接收方能判断消息属于哪个微信账号，避免切号后数据错乱。
+	GetAccount() string
 }
 
 type ContextMessage struct {
@@ -50,21 +68,25 @@ type ContextMessage struct {
 }
 
 type Event struct {
-	ID             int64            `json:"id"`
-	CreatedAt      string           `json:"created_at"`
-	RuleType       string           `json:"rule_type"`
-	RuleLabel      string           `json:"rule_label"`
-	Keyword        string           `json:"keyword"`
-	Talker         string           `json:"talker"`
-	TalkerName     string           `json:"talker_name"`
-	Sender         string           `json:"sender"`
-	SenderName     string           `json:"sender_name"`
-	TriggerSeq     int64            `json:"trigger_seq"`
-	TriggerType    int64            `json:"trigger_type"`
-	TriggerTime    string           `json:"trigger_time"`
-	TriggerContent string           `json:"trigger_content"`
-	Context        []ContextMessage `json:"context"`
-	Deliveries     []DeliveryResult `json:"deliveries,omitempty"`
+	ID             int64  `json:"id"`
+	CreatedAt      string `json:"created_at"`
+	RuleType       string `json:"rule_type"`
+	RuleLabel      string `json:"rule_label"`
+	Keyword        string `json:"keyword"`
+	Talker         string `json:"talker"`
+	TalkerName     string `json:"talker_name"`
+	Sender         string `json:"sender"`
+	SenderName     string `json:"sender_name"`
+	TriggerSeq     int64  `json:"trigger_seq"`
+	TriggerType    int64  `json:"trigger_type"`
+	TriggerTime    string `json:"trigger_time"`
+	TriggerContent string `json:"trigger_content"`
+	// OwnerWxid 是当前 chatlog 监听的微信账号 wxid（已 strip local suffix），
+	// 让 webhook 接收方能区分消息属于哪个账号。
+	OwnerWxid  string           `json:"owner_wxid,omitempty"`
+	AtUserList []string         `json:"at_user_list,omitempty"`
+	Context    []ContextMessage `json:"context"`
+	Deliveries []DeliveryResult `json:"deliveries,omitempty"`
 }
 
 type DeliveryResult struct {
@@ -75,22 +97,32 @@ type DeliveryResult struct {
 }
 
 type Service struct {
-	conf       Config
-	db         *wechatdb.DB
-	httpClient *http.Client
-	notify     func(Event)
-	seenSeq    map[string]int64
-	startAt    time.Time
+	conf        Config
+	db          *wechatdb.DB
+	httpClient  *http.Client
+	notify      func(Event)
+	seenSeq     map[string]int64
+	pendingPost map[string]pendingPostDelivery
+	startAt     time.Time
+}
+
+type pendingPostDelivery struct {
+	URL       string
+	Event     Event
+	Attempts  int
+	NextTryAt time.Time
+	QueuedAt  time.Time
 }
 
 func New(conf Config, db *wechatdb.DB, notify func(Event)) *Service {
 	return &Service{
-		conf:       conf,
-		db:         db,
-		httpClient: &http.Client{Timeout: 10 * time.Second},
-		notify:     notify,
-		seenSeq:    make(map[string]int64),
-		startAt:    time.Now(),
+		conf:        conf,
+		db:          db,
+		httpClient:  &http.Client{Timeout: 10 * time.Second},
+		notify:      notify,
+		seenSeq:     make(map[string]int64),
+		pendingPost: make(map[string]pendingPostDelivery),
+		startAt:     time.Now(),
 	}
 }
 
@@ -102,6 +134,7 @@ func (s *Service) Run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			s.retryPendingPosts(time.Now())
 			if err := s.scanOnce(); err != nil {
 				log.Debug().Err(err).Msg("message hook scan failed")
 			}
@@ -120,6 +153,7 @@ func (s *Service) scanOnce() error {
 	if len(keywords) == 0 && !cfg.ForwardAll && len(forwardContacts) == 0 && len(forwardChatRooms) == 0 {
 		return nil
 	}
+	whitelistOnly := len(keywords) == 0 && !cfg.ForwardAll
 	sessions, err := s.db.GetSessions("", maxTalkerScan, 0)
 	if err != nil || sessions == nil {
 		return err
@@ -129,9 +163,16 @@ func (s *Service) scanOnce() error {
 		if sess == nil || strings.TrimSpace(sess.UserName) == "" {
 			continue
 		}
+		if whitelistOnly && !sessionInForwardWhitelist(sess.UserName, sess.NickName, forwardContacts, forwardChatRooms) {
+			continue
+		}
 		_ = s.scanTalker(now, sess.UserName, keywords, forwardContacts, forwardChatRooms, cfg)
 	}
 	return nil
+}
+
+func sessionInForwardWhitelist(talker, talkerName string, contacts, chatrooms map[string]struct{}) bool {
+	return targetListContains(contacts, talker, talkerName) || targetListContains(chatrooms, talker, talkerName)
 }
 
 func (s *Service) scanTalker(now time.Time, talker string, keywords []string, forwardContacts, forwardChatRooms map[string]struct{}, cfg *conf.MessageHook) error {
@@ -224,6 +265,8 @@ func (s *Service) buildEvent(trigger *model.Message, ruleType, ruleLabel, keywor
 		TriggerType:    trigger.Type,
 		TriggerTime:    trigger.Time.Format("2006-01-02 15:04:05"),
 		TriggerContent: triggerContent,
+		OwnerWxid:      stripChatlogLocalSuffix(s.conf.GetAccount()),
+		AtUserList:     trigger.AtUserList,
 	}
 	evt.Context = s.loadContext(trigger, beforeCount, afterCount)
 	return evt
@@ -302,24 +345,10 @@ func (s *Service) dispatch(cfg *conf.MessageHook, evt Event, trigger *model.Mess
 		if url == "" {
 			evt.Deliveries = append(evt.Deliveries, DeliveryResult{Target: "post", Status: "skipped", Detail: "post_url empty", Success: false})
 		} else {
-			body, err := json.Marshal(evt)
-			if err == nil {
-				req, err := http.NewRequest(http.MethodPost, url, bytes.NewBuffer(body))
-				if err == nil {
-					req.Header.Set("Content-Type", "application/json")
-					resp, err := s.httpClient.Do(req)
-					if err != nil {
-						log.Debug().Err(err).Str("url", url).Msg("message hook post failed")
-						evt.Deliveries = append(evt.Deliveries, DeliveryResult{Target: "post", Status: "failed", Detail: err.Error(), Success: false})
-					} else {
-						defer resp.Body.Close()
-						evt.Deliveries = append(evt.Deliveries, DeliveryResult{Target: "post", Status: "sent", Detail: resp.Status, Success: resp.StatusCode >= 200 && resp.StatusCode < 300})
-					}
-				} else {
-					evt.Deliveries = append(evt.Deliveries, DeliveryResult{Target: "post", Status: "failed", Detail: err.Error(), Success: false})
-				}
-			} else {
-				evt.Deliveries = append(evt.Deliveries, DeliveryResult{Target: "post", Status: "failed", Detail: err.Error(), Success: false})
+			result := s.deliverPost(url, evt)
+			evt.Deliveries = append(evt.Deliveries, result)
+			if !result.Success {
+				s.queuePostRetry(url, evt)
 			}
 		}
 	}
@@ -396,6 +425,105 @@ func (s *Service) dispatch(cfg *conf.MessageHook, evt Event, trigger *model.Mess
 		}
 	}
 	return evt
+}
+
+func (s *Service) deliverPost(url string, evt Event) DeliveryResult {
+	body, err := json.Marshal(evt)
+	if err != nil {
+		return DeliveryResult{Target: "post", Status: "failed", Detail: err.Error(), Success: false}
+	}
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return DeliveryResult{Target: "post", Status: "failed", Detail: err.Error(), Success: false}
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		log.Debug().Err(err).Str("url", url).Msg("message hook post failed")
+		return DeliveryResult{Target: "post", Status: "failed", Detail: err.Error(), Success: false}
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64*1024))
+	_ = resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return DeliveryResult{Target: "post", Status: "failed", Detail: resp.Status, Success: false}
+	}
+	return DeliveryResult{Target: "post", Status: "sent", Detail: resp.Status, Success: true}
+}
+
+func (s *Service) queuePostRetry(url string, evt Event) {
+	if s.pendingPost == nil {
+		s.pendingPost = make(map[string]pendingPostDelivery)
+	}
+	key := postRetryKey(url, evt)
+	now := time.Now()
+	if current, ok := s.pendingPost[key]; ok {
+		current.Event = evt
+		current.NextTryAt = now.Add(postRetryDelay(current.Attempts))
+		s.pendingPost[key] = current
+		return
+	}
+	if len(s.pendingPost) >= maxPendingPosts {
+		oldestKey := ""
+		oldestAt := now
+		for candidateKey, candidate := range s.pendingPost {
+			if oldestKey == "" || candidate.QueuedAt.Before(oldestAt) {
+				oldestKey = candidateKey
+				oldestAt = candidate.QueuedAt
+			}
+		}
+		delete(s.pendingPost, oldestKey)
+	}
+	s.pendingPost[key] = pendingPostDelivery{
+		URL:       url,
+		Event:     evt,
+		NextTryAt: now.Add(postRetryDelay(0)),
+		QueuedAt:  now,
+	}
+}
+
+func (s *Service) retryPendingPosts(now time.Time) {
+	for key, pending := range s.pendingPost {
+		if now.Before(pending.NextTryAt) {
+			continue
+		}
+		result := s.deliverPost(pending.URL, pending.Event)
+		pending.Event.Deliveries = replaceDelivery(pending.Event.Deliveries, result)
+		if result.Success {
+			delete(s.pendingPost, key)
+			if s.notify != nil {
+				s.notify(pending.Event)
+			}
+			continue
+		}
+		pending.Attempts++
+		pending.NextTryAt = now.Add(postRetryDelay(pending.Attempts))
+		s.pendingPost[key] = pending
+	}
+}
+
+func postRetryDelay(attempts int) time.Duration {
+	delay := defaultPollInterval
+	for i := 0; i < attempts && delay < maxPostRetryDelay; i++ {
+		delay *= 2
+	}
+	if delay > maxPostRetryDelay {
+		return maxPostRetryDelay
+	}
+	return delay
+}
+
+func postRetryKey(url string, evt Event) string {
+	return fmt.Sprintf("%s\x00%d\x00%s\x00%s\x00%s\x00%s", evt.Talker, evt.TriggerSeq, evt.RuleType, evt.RuleLabel, evt.Keyword, url)
+}
+
+func replaceDelivery(deliveries []DeliveryResult, replacement DeliveryResult) []DeliveryResult {
+	for index := range deliveries {
+		if deliveries[index].Target == replacement.Target {
+			deliveries[index] = replacement
+			return deliveries
+		}
+	}
+	return append(deliveries, replacement)
 }
 
 func (s *Service) resolveTriggerMedia(trigger *model.Message) ([]string, []string, error) {

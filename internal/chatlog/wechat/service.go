@@ -5,13 +5,16 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	stderrors "errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
@@ -82,6 +85,59 @@ func (s *Service) SetAutoDecryptErrorHandler(handler func(error)) {
 	s.errorHandler = handler
 }
 
+func isTemporaryFileLockError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var errno syscall.Errno
+	if runtime.GOOS == "windows" && stderrors.As(err, &errno) && (errno == syscall.Errno(32) || errno == syscall.Errno(33)) {
+		return true
+	}
+	message := strings.ToLower(err.Error())
+	for _, marker := range []string{
+		"the process cannot access the file",
+		"being used by another process",
+		"file is locked",
+		"access is denied",
+		"sharing violation",
+		"lock violation",
+		"resource temporarily unavailable",
+		"device or resource busy",
+	} {
+		if strings.Contains(message, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Service) handleAutoDecryptError(operation, dbFile string, err error) {
+	if err == nil {
+		return
+	}
+	if isTemporaryFileLockError(err) {
+		log.Warn().Err(err).Str("file", dbFile).Msg(operation + " deferred because the database is temporarily locked")
+		return
+	}
+	if s.errorHandler != nil {
+		s.errorHandler(err)
+	}
+}
+
+func (s *Service) clearWalState(dbFile string) {
+	s.mutex.Lock()
+	delete(s.walStates, dbFile)
+	s.mutex.Unlock()
+}
+
+func (s *Service) fullDecryptForAutoUpdate(dbFile string) {
+	if err := s.DecryptDBFile(dbFile); err != nil {
+		s.handleAutoDecryptError("full decrypt", dbFile, err)
+		return
+	}
+	s.clearWalState(dbFile)
+}
+
 // GetWeChatInstances returns all running WeChat instances
 func (s *Service) GetWeChatInstances() []*wechat.Account {
 	instances, _ := s.GetWeChatInstancesWithError()
@@ -101,7 +157,8 @@ func (s *Service) GetDataKey(info *wechat.Account) (string, error) {
 		return "", fmt.Errorf("no WeChat instance selected")
 	}
 
-	key, _, err := info.GetKey(context.Background())
+	ctx := context.WithValue(context.Background(), "data_key_only", true)
+	key, _, err := info.GetKey(ctx)
 	if err != nil {
 		return "", err
 	}
@@ -111,11 +168,20 @@ func (s *Service) GetDataKey(info *wechat.Account) (string, error) {
 
 // GetImageKey extracts the image key from a WeChat process
 func (s *Service) GetImageKey(info *wechat.Account) (string, error) {
+	return s.GetImageKeyWithStatus(info, nil)
+}
+
+// GetImageKeyWithStatus extracts the image key and forwards detailed progress.
+func (s *Service) GetImageKeyWithStatus(info *wechat.Account, status func(string)) (string, error) {
 	if info == nil {
 		return "", fmt.Errorf("no WeChat instance selected")
 	}
 
-	return info.GetImageKey(context.Background())
+	ctx := context.Background()
+	if status != nil {
+		ctx = context.WithValue(ctx, "status_callback", status)
+	}
+	return info.GetImageKey(ctx)
 }
 
 func (s *Service) StartAutoDecrypt() error {
@@ -224,53 +290,36 @@ func (s *Service) waitAndProcess(dbFile string) {
 			}
 			if flags.sawDB {
 				if !s.conf.GetWalEnabled() || !workCopyExists {
-					if err := s.DecryptDBFile(dbFile); err != nil {
-						if s.errorHandler != nil {
-							s.errorHandler(err)
-						}
-					}
+					s.fullDecryptForAutoUpdate(dbFile)
 					return
 				}
 				if flags.sawWal {
-					handled, err := s.IncrementalDecryptDBFile(dbFile)
+					applied, err := s.IncrementalDecryptDBFile(dbFile)
 					if err != nil {
-						if s.errorHandler != nil {
-							s.errorHandler(err)
-						}
+						s.handleAutoDecryptError("incremental decrypt", dbFile, err)
 						return
 					}
-					if handled {
+					if applied {
 						return
 					}
 				}
+				s.fullDecryptForAutoUpdate(dbFile)
 				return
 			}
 			if flags.sawWal && s.conf.GetWalEnabled() {
-				handled, err := s.IncrementalDecryptDBFile(dbFile)
+				applied, err := s.IncrementalDecryptDBFile(dbFile)
 				if err != nil {
-					if s.errorHandler != nil {
-						s.errorHandler(err)
-					}
+					s.handleAutoDecryptError("incremental decrypt", dbFile, err)
 					return
 				}
-				if handled {
+				if applied {
 					return
 				}
-				if !workCopyExists {
-					if err := s.DecryptDBFile(dbFile); err != nil {
-						if s.errorHandler != nil {
-							s.errorHandler(err)
-						}
-					}
-				}
+				s.fullDecryptForAutoUpdate(dbFile)
 				return
 			}
 			if !s.conf.GetWalEnabled() || !workCopyExists {
-				if err := s.DecryptDBFile(dbFile); err != nil {
-					if s.errorHandler != nil {
-						s.errorHandler(err)
-					}
-				}
+				s.fullDecryptForAutoUpdate(dbFile)
 			}
 			return
 		}
@@ -278,7 +327,7 @@ func (s *Service) waitAndProcess(dbFile string) {
 	}
 }
 
-func (s *Service) DecryptDBFile(dbFile string) error {
+func (s *Service) DecryptDBFile(dbFile string) (err error) {
 
 	decryptor, err := decrypt.NewDecryptor(s.conf.GetPlatform(), s.conf.GetVersion())
 	if err != nil {
@@ -294,33 +343,60 @@ func (s *Service) DecryptDBFile(dbFile string) error {
 		return err
 	}
 
-	outputTemp := output + ".tmp"
-	outputFile, err := os.Create(outputTemp)
+	outputFile, err := os.CreateTemp(filepath.Dir(output), filepath.Base(output)+".tmp-*")
 	if err != nil {
 		return fmt.Errorf("failed to create output file: %v", err)
 	}
+	outputTemp := outputFile.Name()
+	closed := false
+	committed := false
 	defer func() {
-		outputFile.Close()
-		if err := os.Rename(outputTemp, output); err != nil {
-			log.Debug().Err(err).Msgf("failed to rename %s to %s", outputTemp, output)
+		if !closed {
+			_ = outputFile.Close()
+		}
+		if !committed {
+			_ = os.Remove(outputTemp)
 		}
 	}()
 
 	dataKey := s.getDataKeyForDB(dbFile)
-	if err := decryptor.Decrypt(context.Background(), dbFile, dataKey, outputFile); err != nil {
-		if err == errors.ErrAlreadyDecrypted {
-			if data, err := os.ReadFile(dbFile); err == nil {
-				outputFile.Write(data)
+	if decryptErr := decryptor.Decrypt(context.Background(), dbFile, dataKey, outputFile); decryptErr != nil {
+		if decryptErr == errors.ErrAlreadyDecrypted {
+			if truncateErr := outputFile.Truncate(0); truncateErr != nil {
+				return fmt.Errorf("failed to reset decrypted output: %w", truncateErr)
 			}
-			if s.conf.GetWalEnabled() {
-				// Remove WAL files if they exist to prevent SQLite from reading encrypted WALs
-				s.removeWalFiles(output)
+			if _, seekErr := outputFile.Seek(0, io.SeekStart); seekErr != nil {
+				return fmt.Errorf("failed to seek decrypted output: %w", seekErr)
 			}
-			return nil
+			source, openErr := os.Open(dbFile)
+			if openErr != nil {
+				return fmt.Errorf("failed to open already decrypted database: %w", openErr)
+			}
+			_, copyErr := io.Copy(outputFile, source)
+			closeErr := source.Close()
+			if copyErr != nil {
+				return fmt.Errorf("failed to copy already decrypted database: %w", copyErr)
+			}
+			if closeErr != nil {
+				return fmt.Errorf("failed to close source database: %w", closeErr)
+			}
+		} else {
+			log.Err(decryptErr).Msgf("failed to decrypt %s", dbFile)
+			return decryptErr
 		}
-		log.Err(err).Msgf("failed to decrypt %s", dbFile)
+	}
+
+	if err := outputFile.Sync(); err != nil {
+		return fmt.Errorf("failed to sync decrypted database: %w", err)
+	}
+	if err := outputFile.Close(); err != nil {
+		return fmt.Errorf("failed to close decrypted database: %w", err)
+	}
+	closed = true
+	if err := replaceDecryptedFile(outputTemp, output); err != nil {
 		return err
 	}
+	committed = true
 
 	log.Debug().Msgf("Decrypted %s to %s", dbFile, output)
 
@@ -329,6 +405,32 @@ func (s *Service) DecryptDBFile(dbFile string) error {
 		s.removeWalFiles(output)
 	}
 
+	return nil
+}
+
+func replaceDecryptedFile(tempPath, outputPath string) error {
+	if err := os.Rename(tempPath, outputPath); err == nil {
+		return nil
+	} else if _, statErr := os.Stat(outputPath); statErr != nil {
+		return fmt.Errorf("failed to publish decrypted database: %w", err)
+	}
+
+	// Windows does not replace an existing destination with os.Rename. Move the
+	// previous output aside first, then restore it if publishing the new file
+	// fails so a transient lock never destroys the last usable database.
+	backupPath := fmt.Sprintf("%s.bak-%d", outputPath, time.Now().UnixNano())
+	if err := os.Rename(outputPath, backupPath); err != nil {
+		return fmt.Errorf("failed to preserve previous decrypted database: %w", err)
+	}
+	if err := os.Rename(tempPath, outputPath); err != nil {
+		if restoreErr := os.Rename(backupPath, outputPath); restoreErr != nil {
+			return fmt.Errorf("failed to publish decrypted database: %w; restore failed: %v", err, restoreErr)
+		}
+		return fmt.Errorf("failed to publish decrypted database: %w", err)
+	}
+	if err := os.Remove(backupPath); err != nil && !os.IsNotExist(err) {
+		log.Debug().Err(err).Msgf("failed to remove decrypted database backup %s", backupPath)
+	}
 	return nil
 }
 
@@ -495,7 +597,7 @@ func (s *Service) IncrementalDecryptDBFile(dbFile string) (bool, error) {
 
 	decryptor, err := decrypt.NewDecryptor(s.conf.GetPlatform(), s.conf.GetVersion())
 	if err != nil {
-		return true, err
+		return false, err
 	}
 
 	dbInfo, err := common.OpenDBFile(dbFile, decryptor.GetPageSize())
@@ -503,32 +605,32 @@ func (s *Service) IncrementalDecryptDBFile(dbFile string) (bool, error) {
 		if err == errors.ErrAlreadyDecrypted {
 			return false, nil
 		}
-		return true, err
+		return false, err
 	}
 
 	dataKey := s.getDataKeyForDB(dbFile)
 	keyBytes, err := hex.DecodeString(dataKey)
 	if err != nil {
-		return true, errors.DecodeKeyFailed(err)
+		return false, errors.DecodeKeyFailed(err)
 	}
 	if !decryptor.Validate(dbInfo.FirstPage, keyBytes) {
-		return true, errors.ErrDecryptIncorrectKey
+		return false, errors.ErrDecryptIncorrectKey
 	}
 
 	encKey, macKey, err := decryptor.DeriveKeys(keyBytes, dbInfo.Salt)
 	if err != nil {
-		return true, err
+		return false, err
 	}
 
 	walFile, err := os.Open(walPath)
 	if err != nil {
-		return true, err
+		return false, err
 	}
 	defer walFile.Close()
 
 	info, err := walFile.Stat()
 	if err != nil {
-		return true, err
+		return false, err
 	}
 	if info.Size() < walHeaderSize {
 		return false, nil
@@ -536,14 +638,14 @@ func (s *Service) IncrementalDecryptDBFile(dbFile string) (bool, error) {
 
 	headerBuf := make([]byte, walHeaderSize)
 	if _, err := io.ReadFull(walFile, headerBuf); err != nil {
-		return true, err
+		return false, err
 	}
 	order, pageSize, salt1, salt2, err := parseWalHeader(headerBuf)
 	if err != nil {
-		return true, err
+		return false, err
 	}
 	if pageSize != 0 && pageSize != uint32(decryptor.GetPageSize()) {
-		return true, fmt.Errorf("unexpected wal page size: %d", pageSize)
+		return false, fmt.Errorf("unexpected wal page size: %d", pageSize)
 	}
 
 	s.mutex.Lock()
@@ -559,12 +661,12 @@ func (s *Service) IncrementalDecryptDBFile(dbFile string) (bool, error) {
 	s.mutex.Unlock()
 
 	if _, err := walFile.Seek(startOffset, io.SeekStart); err != nil {
-		return true, err
+		return false, err
 	}
 
 	outputFile, err := os.OpenFile(output, os.O_RDWR, 0)
 	if err != nil {
-		return true, err
+		return false, err
 	}
 	defer outputFile.Close()
 
@@ -603,7 +705,7 @@ func (s *Service) IncrementalDecryptDBFile(dbFile string) (bool, error) {
 
 		if commit != 0 {
 			if err := applyWalFrames(outputFile, txFrames, decryptor, encKey, macKey); err != nil {
-				return true, err
+				return false, err
 			}
 			txFrames = txFrames[:0]
 			lastCommitOffset = curOffset
@@ -624,10 +726,7 @@ func (s *Service) IncrementalDecryptDBFile(dbFile string) (bool, error) {
 	// Remove WAL files if they exist to prevent SQLite from reading encrypted WALs
 	s.removeWalFiles(output)
 
-	if applied {
-		return true, nil
-	}
-	return true, nil
+	return applied, nil
 }
 
 type allKeysEntry struct {

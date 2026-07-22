@@ -55,8 +55,9 @@ type Service struct {
 	statsCacheMu sync.RWMutex
 	statsCache   map[string]statsCacheEntry
 
-	semantic *semantic.Manager
-	graph    *temporalgraph.Manager
+	semantic  *semantic.Manager
+	graph     *temporalgraph.Manager
+	sendDebug *sendDebugManager
 
 	semanticWatchMu      sync.Mutex
 	semanticWatchCancel  context.CancelFunc
@@ -105,7 +106,7 @@ func NewService(conf Config, db *database.Service) *Service {
 		errors.RecoveryMiddleware(),
 		errors.ErrorHandlerMiddleware(),
 		gin.LoggerWithWriter(log.Logger, "/health"),
-		corsMiddleware(),
+		corsMiddleware(conf.GetHTTPAddr()),
 	)
 
 	s := &Service{
@@ -117,6 +118,7 @@ func NewService(conf Config, db *database.Service) *Service {
 		hookEvents:       make([]messagehook.Event, 0, 200),
 		hookSubscribers:  map[chan messagehook.Event]struct{}{},
 		statsCache:       map[string]statsCacheEntry{},
+		sendDebug:        newSendDebugManager(),
 	}
 	sem, err := semantic.NewManager(conf, db)
 	if err != nil {
@@ -171,7 +173,9 @@ func (s *Service) ListenAndServe() error {
 }
 
 func (s *Service) Stop() error {
-
+	if s.sendDebug != nil {
+		s.sendDebug.close()
+	}
 	if s.server == nil {
 		return nil
 	}
@@ -198,6 +202,10 @@ func (s *Service) Stop() error {
 
 func (s *Service) startSemanticIncrementalWatcher() {
 	if s.semantic == nil || s.db == nil {
+		return
+	}
+	cfg := s.conf.GetSemanticConfig()
+	if cfg == nil || !cfg.Enabled || !cfg.RealtimeIndex {
 		return
 	}
 	s.semanticWatchMu.Lock()
@@ -239,6 +247,9 @@ func (s *Service) runSemanticIncrementalWatcher(ctx context.Context) {
 		latest := 0
 		for _, item := range sessions.Items {
 			if item == nil {
+				continue
+			}
+			if !conf.SemanticTalkerAllowed(*cfg, item.UserName) {
 				continue
 			}
 			if item.NOrder > latest {

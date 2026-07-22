@@ -2,6 +2,8 @@ package windows
 
 import (
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/rs/zerolog/log"
 	"github.com/shirou/gopsutil/v4/process"
@@ -15,14 +17,29 @@ const (
 	V4ProcessName = "Weixin"
 	V3DBFile      = `Msg\Misc.db`
 	V4DBFile      = `db_storage\session\session.db`
+
+	noDataDirRecheckInterval = 30 * time.Second
 )
 
+type processCacheEntry struct {
+	info      *model.Process
+	hasData   bool
+	checkedAt time.Time
+}
+
 // Detector 实现 Windows 平台的进程检测器
-type Detector struct{}
+type Detector struct {
+	mu    sync.Mutex
+	cache map[uint32]processCacheEntry
+}
 
 // NewDetector 创建一个新的 Windows 检测器
 func NewDetector() *Detector {
-	return &Detector{}
+	return &Detector{cache: make(map[uint32]processCacheEntry)}
+}
+
+func isWeixinChildCommandLine(commandLine string) bool {
+	return strings.Contains(commandLine, "--type=")
 }
 
 // FindProcesses 查找所有微信进程并返回它们的信息
@@ -33,7 +50,12 @@ func (d *Detector) FindProcesses() ([]*model.Process, error) {
 		return nil, err
 	}
 
-	var result []*model.Process
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	result := make([]*model.Process, 0, 2)
+	alivePIDs := make(map[uint32]struct{})
+	now := time.Now()
 	for _, p := range processes {
 		name, err := p.Name()
 		name = strings.TrimSuffix(name, ".exe")
@@ -41,16 +63,26 @@ func (d *Detector) FindProcesses() ([]*model.Process, error) {
 			continue
 		}
 
-		// v4 存在同名进程，需要继续判断 cmdline
+		pid := uint32(p.Pid)
+
+		// V4 的 Chromium 子进程会携带 --type=；主进程也可能有
+		// --scene= 等参数，因此只排除明确的子进程参数。
 		if name == V4ProcessName {
-			cmdline, err := p.Cmdline()
+			commandLine, err := p.Cmdline()
 			if err != nil {
-				log.Err(err).Msg("获取进程命令行失败")
+				log.Debug().Err(err).Msgf("获取进程 %d 命令行失败", p.Pid)
 				continue
 			}
-			if strings.Contains(cmdline, "--") {
+			if isWeixinChildCommandLine(commandLine) {
 				continue
 			}
+		}
+		alivePIDs[pid] = struct{}{}
+
+		if entry, ok := d.cache[pid]; ok && (entry.hasData || now.Sub(entry.checkedAt) < noDataDirRecheckInterval) {
+			cached := *entry.info
+			result = append(result, &cached)
+			continue
 		}
 
 		// 获取进程信息
@@ -60,7 +92,19 @@ func (d *Detector) FindProcesses() ([]*model.Process, error) {
 			continue
 		}
 
-		result = append(result, procInfo)
+		d.cache[pid] = processCacheEntry{
+			info:      procInfo,
+			hasData:   procInfo.DataDir != "",
+			checkedAt: now,
+		}
+		copyInfo := *procInfo
+		result = append(result, &copyInfo)
+	}
+
+	for pid := range d.cache {
+		if _, ok := alivePIDs[pid]; !ok {
+			delete(d.cache, pid)
+		}
 	}
 
 	return result, nil

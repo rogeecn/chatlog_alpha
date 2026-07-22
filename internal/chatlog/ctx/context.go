@@ -200,6 +200,13 @@ func (c *Context) GetDataDir() string {
 	return c.DataDir
 }
 
+// GetAccount 返回当前激活的 chatlog account（含 local hex suffix），用于
+// messagehook 把它 strip 后填到 Event.OwnerWxid，让 webhook 接收方能判定
+// 消息属于哪个微信账号，避免切号期间数据错乱。
+func (c *Context) GetAccount() string {
+	return c.Account
+}
+
 func (c *Context) GetWorkDir() string {
 	return c.WorkDir
 }
@@ -324,6 +331,16 @@ func (c *Context) SetImgKey(key string) {
 		return
 	}
 	c.ImgKey = key
+	c.UpdateConfig()
+}
+
+func (c *Context) SetDataKey(key string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.DataKey == key {
+		return
+	}
+	c.DataKey = key
 	c.UpdateConfig()
 }
 

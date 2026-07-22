@@ -20,6 +20,9 @@ type DataSource interface {
 	// 联系人
 	GetContacts(ctx context.Context, key string, limit, offset int) ([]*model.Contact, error)
 
+	// 企业微信（@openim）corp_id → 企业名映射（来自 contact.db.openim_wording 表）
+	GetOpenimWordings(ctx context.Context) ([]*model.OpenimWording, error)
+
 	// 群聊
 	GetChatRooms(ctx context.Context, key string, limit, offset int) ([]*model.ChatRoom, error)
 
@@ -28,6 +31,7 @@ type DataSource interface {
 
 	// 媒体
 	GetMedia(ctx context.Context, _type string, key string) (*model.Media, error)
+	GetMediaByName(ctx context.Context, _type string, name string, size int64) (*model.Media, error)
 
 	// 朋友圈
 	GetSNSTimeline(ctx context.Context, username string, limit, offset int) ([]map[string]interface{}, error)
