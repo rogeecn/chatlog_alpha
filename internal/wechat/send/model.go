@@ -9,7 +9,7 @@ import (
 )
 
 const (
-	SupportedWeChatVersion = "4.1.11.54"
+	SupportedWeChatVersion = "4.1.11.55"
 	MaxTextBytes           = 32 * 1024
 	MaxImageBytes          = 20 * 1024 * 1024
 	MaxReceiverBytes       = 255

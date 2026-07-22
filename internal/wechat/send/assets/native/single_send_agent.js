@@ -3,16 +3,16 @@
 const RESOURCE_SUFFIX = '/Contents/Resources/wechat.dylib';
 
 const OFFSETS = {
-    sendFuncAddr: 0x5121458,
+    sendFuncAddr: 0x5121478,
     sendFuncHookDelta: 0x10,
-    req2bufEnterHookAddr: 0x3e5930c,
-    req2bufExitHookAddr: 0x3e5a260,
-    blrX8HookAddr: 0x3e5938c,
-    autoBufferWriteFunc: 0x3e7ff18,
+    req2bufEnterHookAddr: 0x3e59300,
+    req2bufExitHookAddr: 0x3e5a254,
+    blrX8HookAddr: 0x3e59380,
+    autoBufferWriteFunc: 0x3e7ff0c,
     // 上游真正用于 ack/receiver 的 buf2resp 数据点；这里 x20=data, x0=len, sp+0x140≈taskId。
-    buf2RespAckHookAddr: 0x3e7eaf0,
+    buf2RespAckHookAddr: 0x3e7eae4,
     // 这是 MMStartTask/OnTaskEnd 附近的日志包装点，只能做观测，不能当 ack 清理点。
-    logBuf2RespHookAddr: 0x51233f8,
+    logBuf2RespHookAddr: 0x5123418,
 };
 
 let listeners = [];
@@ -178,7 +178,7 @@ function attachHooks(module) {
             if (!sending || taskIdGlobal === 0 || !this.context.x1.equals(ptr(taskIdGlobal))) {
                 return;
             }
-            // 当前 4.1.11.54 的 hook 点在 `mov x24, x19` 前，所以用 x19 作为 base。
+            // 当前 4.1.11.55 的 hook 点在 `mov x24, x19` 前，所以用 x19 作为 base。
             const base = this.context.x19;
             if (!readable(base.add(0x60))) {
                 emit('req2buf_insert_error', {error: 'base+0x60 unreadable', base: base.toString()});

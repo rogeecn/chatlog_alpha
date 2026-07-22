@@ -146,7 +146,7 @@ func TestImageAgentHasIdleStartTaskFallback(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := string(source)
-	for _, expected := range []string{"defaultStartTaskFuncAddr: 0x51173b0", "default_manager_wrapper"} {
+	for _, expected := range []string{"defaultStartTaskFuncAddr: 0x51173d0", "default_manager_wrapper"} {
 		if !strings.Contains(text, expected) {
 			t.Fatalf("image agent missing idle StartTask fallback %q", expected)
 		}

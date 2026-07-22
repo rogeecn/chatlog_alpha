@@ -20,7 +20,7 @@ from native_probe import find_wechat_pid
 
 ROOT = Path(__file__).resolve().parent
 AGENT = ROOT / "native/single_send_agent.js"
-PROFILE = ROOT / "profiles/4.1.11.54-candidate.json"
+PROFILE = ROOT / "profiles/4.1.11.55-candidate.json"
 MAX_EVENT_LOG_BYTES = 8 * 1024 * 1024
 _PRINT_LOCK = threading.Lock()
 

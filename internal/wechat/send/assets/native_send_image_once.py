@@ -407,7 +407,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument(
         "--proactive-upload-wrapper",
         action="store_true",
-        help="主动调用图片上传入口 wrapper（module.base+0x525a008），不再等待用户手动发图捕获 upload x0。",
+        help="主动调用图片上传入口 wrapper（module.base+0x525a028），不再等待用户手动发图捕获 upload x0。",
     )
     ap.add_argument("--i-accept-freeze-risk", action="store_true")
     ap.add_argument(
@@ -1065,8 +1065,8 @@ def main() -> int:
             else:
                 progress(4, 8, "混合 Session 已就绪：文本直发，后续图片使用主动上传 wrapper")
             print(
-                "      使用 module.base+0x525a008 获取 WeChat 内部上传服务；"
-                "发送阶段使用 module.base+0x51173b0 自动取得默认 MMSTN manager；"
+                "      使用 module.base+0x525a028 获取 WeChat 内部上传服务；"
+                "发送阶段使用 module.base+0x51173d0 自动取得默认 MMSTN manager；"
                 "不再依赖碰巧捕获其他 StartTask 流量。",
                 flush=True,
             )

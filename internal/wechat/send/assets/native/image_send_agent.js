@@ -3,30 +3,30 @@
 const RESOURCE_SUFFIX = '/Contents/Resources/wechat.dylib';
 
 const OFFSETS = {
-    sendFuncAddr: 0x5121458,
+    sendFuncAddr: 0x5121478,
     sendFuncHookDelta: 0x10,
     // Looks up the default MMSTN manager and calls MMStartTask internally.
     // This is the idle-process fallback when no unrelated StartTask call has
     // been observed since the one-shot Frida session attached.
-    defaultStartTaskFuncAddr: 0x51173b0,
-    req2bufEnterHookAddr: 0x3e5930c,
-    req2bufExitHookAddr: 0x3e5a260,
-    blrX8HookAddr: 0x3e5938c,
-    autoBufferWriteFunc: 0x3e7ff18,
-    buf2RespAckHookAddr: 0x3e7eaf0,
-    logBuf2RespHookAddr: 0x51233f8,
+    defaultStartTaskFuncAddr: 0x51173d0,
+    req2bufEnterHookAddr: 0x3e59300,
+    req2bufExitHookAddr: 0x3e5a254,
+    blrX8HookAddr: 0x3e59380,
+    autoBufferWriteFunc: 0x3e7ff0c,
+    buf2RespAckHookAddr: 0x3e7eae4,
+    logBuf2RespHookAddr: 0x5123418,
 
-    uploadImageAddr: 0x529c1fc,
-    uploadImageEntryWrapperAddr: 0x525a008,
-    cndOnCompleteAddr: 0x3e15be8,
-    uploadGetCallbackWrapperAddr: 0x525afa0,
-    uploadGetCallbackWrapperFuncAddr: 0x3e15484,
-    uploadOnCompleteAddr: 0x525b758,
-    uploadOnCompleteFuncAddr: 0x3e16608,
+    uploadImageAddr: 0x529c21c,
+    uploadImageEntryWrapperAddr: 0x525a028,
+    cndOnCompleteAddr: 0x3e15bdc,
+    uploadGetCallbackWrapperAddr: 0x525afc0,
+    uploadGetCallbackWrapperFuncAddr: 0x3e15478,
+    uploadOnCompleteAddr: 0x525b778,
+    uploadOnCompleteFuncAddr: 0x3e165fc,
     // StartC2CUpload preflight probes. These are observation-only and let the
     // host distinguish missing manager RSA state from request/path rejection;
     // both otherwise collapse to signed -20003.
-    uploadRsaPreflightAddr: 0x529bba0,
+    uploadRsaPreflightAddr: 0x529bbc0,
 };
 
 let triggerX0 = ptr(0);
@@ -1268,7 +1268,7 @@ function triggerUploadImage(receiver, md5, imagePath, payloadHex, allowStaticCal
     // The live-validated synthetic upload object is fragile: it expects the
     // same short-string layout used by the original test harness. Do not patch
     // the adjacent libc++ length words here; writing dynamic lengths caused
-    // StartC2CUpload to reject the object with -20003 on 4.1.11.54.
+    // StartC2CUpload to reject the object with -20003 on 4.1.11.55.
     imageUploadSequence += 1;
     const fileId = receiver + '_' + String(Math.floor(Date.now() / 1000)) + '_' + Math.floor(Math.random() * 1001) + '_1';
     generation.fileId = fileId;

@@ -35,8 +35,10 @@ type ActionStatus struct {
 	FullVersion            string `json:"full_version"`
 	DataDir                string `json:"data_dir"`
 	WorkDir                string `json:"work_dir"`
-	DataKey                string `json:"data_key"`
-	ImageKey               string `json:"image_key"`
+	DataKey                string `json:"data_key,omitempty"`
+	ImageKey               string `json:"image_key,omitempty"`
+	DataKeyPresent         bool   `json:"data_key_present"`
+	ImageKeyPresent        bool   `json:"image_key_present"`
 	HTTPEnabled            bool   `json:"http_enabled"`
 	HTTPAddr               string `json:"http_addr"`
 	AutoDecompress         bool   `json:"auto_decompress"`
@@ -118,6 +120,8 @@ func (m *Manager) Snapshot() ActionStatus {
 	if httpAddr == "" {
 		httpAddr = m.ctx.GetHTTPAddr()
 	}
+	dataKey := firstNonEmpty(m.ctx.DataKey, history.DataKey)
+	imageKey := firstNonEmpty(m.ctx.ImgKey, history.ImgKey)
 	return ActionStatus{
 		Account:                m.ctx.Account,
 		PID:                    m.ctx.PID,
@@ -128,14 +132,23 @@ func (m *Manager) Snapshot() ActionStatus {
 		FullVersion:            m.ctx.FullVersion,
 		DataDir:                dataDir,
 		WorkDir:                workDir,
-		DataKey:                firstNonEmpty(m.ctx.DataKey, history.DataKey),
-		ImageKey:               firstNonEmpty(m.ctx.ImgKey, history.ImgKey),
+		DataKey:                redactActionSecret(dataKey),
+		ImageKey:               redactActionSecret(imageKey),
+		DataKeyPresent:         dataKey != "",
+		ImageKeyPresent:        imageKey != "",
 		HTTPEnabled:            m.ctx.HTTPEnabled,
 		HTTPAddr:               httpAddr,
 		AutoDecompress:         m.ctx.AutoDecrypt,
 		WalEnabled:             m.ctx.WalEnabled,
 		AutoDecompressDebounce: m.ctx.AutoDecryptDebounce,
 	}
+}
+
+func redactActionSecret(value string) string {
+	if value == "" {
+		return ""
+	}
+	return "******"
 }
 
 func firstNonEmpty(values ...string) string {
